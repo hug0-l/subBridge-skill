@@ -1,0 +1,250 @@
+{
+  "zh": {
+    "name": "Chinese",
+    "native_name": "中文",
+    "variants": {
+      "tw": {
+        "label": "臺灣正體",
+        "script": "traditional",
+        "wiki_variant": "zh-tw",
+        "quote_open": "「",
+        "quote_close": "」",
+        "quote_open_second": "『",
+        "quote_close_second": "』",
+        "punctuation": "fullwidth",
+        "name_db": "wikipedia_zh",
+        "codepage": "utf-8",
+        "prompt_hint": "使用臺灣正體中文，採用「」作為引號，專有名詞依臺灣官方譯名"
+      },
+      "cn": {
+        "label": "中国大陆简体",
+        "script": "simplified",
+        "wiki_variant": "zh-cn",
+        "quote_open": "“",
+        "quote_close": "”",
+        "quote_open_second": "‘",
+        "quote_close_second": "’",
+        "punctuation": "fullwidth",
+        "name_db": "wikipedia_zh",
+        "codepage": "utf-8",
+        "prompt_hint": "使用中国大陆简体中文，采用“”作为引号，专有名词依中国大陆官方译名"
+      },
+      "hk": {
+        "label": "香港繁體",
+        "script": "traditional",
+        "wiki_variant": "zh-hk",
+        "quote_open": "「",
+        "quote_close": "」",
+        "quote_open_second": "『",
+        "quote_close_second": "』",
+        "punctuation": "fullwidth",
+        "name_db": "wikipedia_zh",
+        "codepage": "utf-8",
+        "prompt_hint": "使用香港繁體中文，採用「」作為引號，專有名詞依香港慣用譯名"
+      }
+    }
+  },
+  "ja": {
+    "name": "Japanese",
+    "native_name": "日本語",
+    "variants": {
+      "jp": {
+        "label": "Standard Japanese",
+        "script": "mixed",
+        "quote_open": "「",
+        "quote_close": "」",
+        "quote_open_second": "『",
+        "quote_close_second": "』",
+        "punctuation": "fullwidth",
+        "codepage": "utf-8"
+      }
+    }
+  },
+  "en": {
+    "name": "English",
+    "native_name": "English",
+    "variants": {
+      "us": {
+        "label": "American English",
+        "script": "latin",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "quote_open_second": "'",
+        "quote_close_second": "'",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8"
+      },
+      "uk": {
+        "label": "British English",
+        "script": "latin",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "quote_open_second": "'",
+        "quote_close_second": "'",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8",
+        "prompt_hint": "Use British English spelling (colour, centre, realise)"
+      }
+    }
+  },
+  "pt": {
+    "name": "Portuguese",
+    "native_name": "Português",
+    "variants": {
+      "pt": {
+        "label": "European Portuguese",
+        "script": "latin",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8",
+        "prompt_hint": "Use European Portuguese (autocarro, comboio, fato)"
+      },
+      "br": {
+        "label": "Brazilian Portuguese",
+        "script": "latin",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8",
+        "prompt_hint": "Use Brazilian Portuguese (ônibus, trem, terno)"
+      }
+    }
+  },
+  "es": {
+    "name": "Spanish",
+    "native_name": "Español",
+    "variants": {
+      "es": {
+        "label": "European Spanish",
+        "script": "latin",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "quote_open_second": "«",
+        "quote_close_second": "»",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8"
+      },
+      "mx": {
+        "label": "Mexican Spanish",
+        "script": "latin",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8"
+      }
+    }
+  },
+  "fr": {
+    "name": "French",
+    "native_name": "Français",
+    "variants": {
+      "fr": {
+        "label": "European French",
+        "script": "latin",
+        "quote_open": "«",
+        "quote_close": "»",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8"
+      },
+      "ca": {
+        "label": "Canadian French",
+        "script": "latin",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8"
+      }
+    }
+  },
+  "ko": {
+    "name": "Korean",
+    "native_name": "한국어",
+    "variants": {
+      "kr": {
+        "label": "Standard Korean",
+        "script": "hangul",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "quote_open_second": "'",
+        "quote_close_second": "'",
+        "punctuation": "fullwidth",
+        "codepage": "utf-8"
+      }
+    }
+  },
+  "de": {
+    "name": "German",
+    "native_name": "Deutsch",
+    "variants": {
+      "de": {
+        "label": "Standard German",
+        "script": "latin",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "quote_open_second": "„",
+        "quote_close_second": "“",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8"
+      }
+    }
+  },
+  "ar": {
+    "name": "Arabic",
+    "native_name": "العربية",
+    "variants": {
+      "sa": {
+        "label": "Modern Standard Arabic",
+        "script": "arabic",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "punctuation": "arabic",
+        "codepage": "utf-8"
+      }
+    }
+  },
+  "th": {
+    "name": "Thai",
+    "native_name": "ไทย",
+    "variants": {
+      "th": {
+        "label": "Standard Thai",
+        "script": "thai",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "punctuation": "thai",
+        "codepage": "utf-8"
+      }
+    }
+  },
+  "vi": {
+    "name": "Vietnamese",
+    "native_name": "Tiếng Việt",
+    "variants": {
+      "vn": {
+        "label": "Standard Vietnamese",
+        "script": "latin",
+        "quote_open": "\"",
+        "quote_close": "\"",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8"
+      }
+    }
+  },
+  "ru": {
+    "name": "Russian",
+    "native_name": "Русский",
+    "variants": {
+      "ru": {
+        "label": "Standard Russian",
+        "script": "cyrillic",
+        "quote_open": "«",
+        "quote_close": "»",
+        "quote_open_second": "\"",
+        "quote_close_second": "\"",
+        "punctuation": "halfwidth",
+        "codepage": "utf-8"
+      }
+    }
+  }
+}
