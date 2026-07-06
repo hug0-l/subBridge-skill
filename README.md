@@ -2,6 +2,31 @@
 
 Agent-powered subtitle translation tool for opencode. Translates SRT/ASS/VTT/SUB/SMI/LRC with complete format preservation, multi-region support, and automatic glossary building via Wikipedia API.
 
+## Pipeline
+
+```mermaid
+flowchart LR
+    A[Subtitle File<br>SRT/ASS/VTT/SUB/SMI/LRC] --> B[parse.py]
+    B --> C[cache.json]
+    C --> D[batch.py read]
+    D --> E[Agent translates<br>each segment]
+    E --> F[batch.py write]
+    F --> C
+    C --> G{All done?}
+    G -->|No| D
+    G -->|Yes| H[export.py]
+    H --> I[Translated<br>Subtitle]
+
+    C -.-> J[glossary.py discover]
+    J -.-> K[glossary.py fetch<br>Wikipedia API]
+    K -.-> L[glossary.locked.json]
+    L -.-> E
+
+    style A fill:#e1f5fe
+    style I fill:#c8e6c9
+    style E fill:#fff3e0,stroke:#ff9800
+```
+
 ## Quick Start
 
 ```bash
