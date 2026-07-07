@@ -776,6 +776,157 @@ def cmd_batch(args):
         print(e, file=sys.stderr)
 
 
+# ── Scan Movie Collection ──────────────────────────────────
+
+_CHI_LANG_SUFFIXES = {".zh", ".chi", ".zho", ".chinese",
+                      ".zh-hk", ".zh-tw", ".zh-cn", ".hk", ".cn",
+                      ".hksrt", ".chi_hk"}
+
+_SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".smi"}
+
+# Common Chinese character ranges for content detection
+_CJK_RANGES = [
+    (0x4E00, 0x9FFF),   # CJK Unified Ideographs
+    (0x3400, 0x4DBF),   # CJK Unified Ideographs Extension A
+    (0x2E80, 0x2EFF),   # CJK Radicals Supplement
+    (0x3000, 0x303F),   # CJK Symbols and Punctuation
+    (0xFF00, 0xFFEF),   # Fullwidth Forms
+]
+
+
+def _has_chi_subtitle(folder: str) -> tuple:
+    """Check if a movie folder has Chinese subtitles.
+    
+    Returns (has_chi: bool, details: str).
+    """
+    has_chi = False
+    details = []
+    total_subs = 0
+
+    try:
+        for f in os.scandir(folder):
+            if not f.is_file():
+                continue
+            ext = os.path.splitext(f.name)[1].lower()
+            if ext not in _SUBTITLE_EXTS:
+                continue
+            total_subs += 1
+
+            stem = f.name[:f.name.rfind('.')]
+            # Check filename language suffix
+            found_chi = False
+            for suf in _CHI_LANG_SUFFIXES:
+                if stem.lower().endswith(suf):
+                    has_chi = True
+                    found_chi = True
+                    details.append(f"  ✓ {f.name} (tag: {suf})")
+                    break
+
+            if found_chi:
+                continue
+
+            # No language tag → detect content
+            try:
+                with open(f.path, 'rb') as fh:
+                    head = fh.read(4096)
+                text = head.decode('utf-8', errors='replace')
+                for lo, hi in _CJK_RANGES:
+                    if any(lo <= ord(c) <= hi for c in text):
+                        has_chi = True
+                        details.append(f"  ✓ {f.name} (content detect)")
+                        break
+            except Exception:
+                pass
+
+        return has_chi, "\n".join(details) if details else ("has_chi" if has_chi else "no subs found")
+    except Exception as e:
+        return False, f"error: {e}"
+
+
+def scan_movie_collection(movies_dir: str, output: str = "",
+                           limit: int = 0) -> dict:
+    """Scan all movie folders for Chinese subtitles.
+    
+    Returns stats dict.
+    """
+    movies_dir = os.path.abspath(movies_dir)
+    if not os.path.isdir(movies_dir):
+        print(f"Error: directory not found: {movies_dir}", file=sys.stderr)
+        return {"error": "directory not found"}
+
+    # Skip known non-movie entries
+    skip = {".filerun.thumbnails", ".skipme", "@eaDir", "System Volume Information"}
+    folders = sorted([
+        f for f in os.listdir(movies_dir)
+        if os.path.isdir(os.path.join(movies_dir, f))
+        and f not in skip
+    ])
+
+    if limit > 0:
+        folders = folders[:limit]
+
+    total = len(folders)
+    have_chi = []
+    missing = []
+
+    print(f"Scanning {total} movie folders...", file=sys.stderr)
+    for i, folder in enumerate(folders, 1):
+        full_path = os.path.join(movies_dir, folder)
+        has_chi, _ = _has_chi_subtitle(full_path)
+        if has_chi:
+            have_chi.append(folder)
+        else:
+            missing.append(folder)
+
+        if i % 100 == 0 or i == total:
+            print(f"  {i}/{total} ({len(missing)} missing so far)", file=sys.stderr)
+
+    # Write report
+    report = []
+    report.append(f"══ 缺少中文字幕的電影 ({len(missing)}部) ══")
+    for m in missing:
+        report.append(m)
+
+    report.append(f"\n══ 已有中文字幕的電影 ({len(have_chi)}部) ══")
+    for h in have_chi:
+        report.append(h)
+
+    report.append(f"\n══ 統計 ══")
+    report.append(f"總計: {total}")
+    report.append(f"已有中文: {len(have_chi)}")
+    report.append(f"缺少中文: {len(missing)}")
+
+    report_text = "\n".join(report)
+
+    if output:
+        os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(report_text + "\n")
+        print(f"\nReport saved: {output}", file=sys.stderr)
+
+    print(f"\n══ 統計 ══", file=sys.stderr)
+    print(f"總計: {total}", file=sys.stderr)
+    print(f"已有中文: {len(have_chi)}", file=sys.stderr)
+    print(f"缺少中文: {len(missing)}", file=sys.stderr)
+
+    return {
+        "total": total,
+        "have_chi": len(have_chi),
+        "missing": len(missing),
+        "missing_list": missing,
+    }
+
+
+def cmd_scan(args):
+    result = scan_movie_collection(
+        args.movies,
+        output=args.output or "",
+        limit=args.limit or 0,
+    )
+    if "error" in result:
+        sys.exit(1)
+
+
 # ── CLI Commands ────────────────────────────────────────────
 
 def cmd_detect(args):
@@ -872,6 +1023,11 @@ def main(argv=None):
                    choices=["nordic", "western", "asia"])
     b.add_argument("--glossary", help="Path to glossary.locked.json")
 
+    s = sub.add_parser("scan", help="Scan movie collection for missing Chinese subtitles")
+    s.add_argument("--movies", "-m", required=True, help="Movie collection directory")
+    s.add_argument("--output", "-o", help="Save report to file")
+    s.add_argument("--limit", type=int, default=0, help="Scan only first N folders (for testing)")
+
     args = ap.parse_args(argv)
     if args.command == "detect":
         cmd_detect(args)
@@ -881,6 +1037,8 @@ def main(argv=None):
         cmd_translate(args)
     elif args.command == "batch":
         cmd_batch(args)
+    elif args.command == "scan":
+        cmd_scan(args)
 
 
 if __name__ == "__main__":
