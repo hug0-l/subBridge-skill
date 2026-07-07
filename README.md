@@ -1,30 +1,9 @@
 # subBridge — Subtitle Translation Skill
 
-Agent-powered subtitle translation tool for opencode. Translates SRT/ASS/VTT/SUB/SMI/LRC with complete format preservation, multi-region support, and automatic glossary building via Wikipedia API.
+Agent-powered subtitle translation for opencode. Translates **SRT/ASS/VTT/SUB/SMI/LRC** with format preservation, multi-region support, and automatic glossary building.
 
-## Pipeline
-
-```mermaid
-flowchart LR
-    A[Subtitle File<br>SRT/ASS/VTT/SUB/SMI/LRC] --> B[parse.py]
-    B --> C[cache.json]
-    C --> D[batch.py read]
-    D --> E[Agent translates<br>each segment]
-    E --> F[batch.py write]
-    F --> C
-    C --> G{All done?}
-    G -->|No| D
-    G -->|Yes| H[export.py]
-    H --> I[Translated<br>Subtitle]
-
-    C -.-> J[glossary.py discover]
-    J -.-> K[glossary.py fetch<br>Wikipedia API]
-    K -.-> L[glossary.locked.json]
-    L -.-> E
-
-    style A fill:#e1f5fe
-    style I fill:#c8e6c9
-    style E fill:#fff3e0,stroke:#ff9800
+```
+https://github.com/hug0-l/subBridge-skill
 ```
 
 ## Quick Start
@@ -32,56 +11,78 @@ flowchart LR
 ```bash
 pip install pysubs2 httpx chardet
 
-# Parse subtitle
-cd subbridge
-python parse.py --input episode.srt --target-lang zh --region tw -o work/cache.json
+# 1. Parse
+python -m parse --input episode.srt --source-lang en --target-lang zh --region hk --context auto --market asia -o work/cache.json
 
-# Auto-build glossary
-python glossary.py fetch --cache work/cache.json --source-lang en --target-lang zh --region tw -o work/glossary.populated.json --limit 50
+# 2. Glossary
+python -m glossary fetch --cache work/cache.json --source-lang en --target-lang zh --region hk -o work/glossary.populated.json --limit 50
+python -m glossary lock -i work/glossary.populated.json -o work/glossary.locked.json
 
-# Translate (loop until done)
-python batch.py read work/cache.json --size 50 --output work/batch.json
-# → agent translates batch.json → work/translations_001.json
-python batch.py write work/cache.json work/translations_001.json
+# 3. Auto-translate (handles sound effects + common phrases)
+python -m batch read work/cache.json --size 1000 --auto --glossary work/glossary.locked.json --tm work/tm.json --tm-save work/tm.json --uncertain work/uncertain.json --context auto -o work/auto_batch.json
+python -m batch write work/cache.json work/auto_batch.json
 
-# Export
-python export.py --cache work/cache.json -o output_translated.srt
+# 4. Subagent translates remaining uncertain segments
+# → use prompt_builder for consistent instructions
+python -m prompt_builder --input work/uncertain.json -o prompt.txt --context auto
+# → paste prompt into subagent, get translations.json
+python -m batch write work/cache.json work/translations.json
+
+# 5. Export (single language or bilingual)
+python -m export --cache work/cache.json -o episode.zh-hk.srt
+python -m export --cache work/cache.json -o episode.bilingual.srt --bilingual
+
+# 6. Verify
+python -m verify quality work/cache.json --market asia
+python -m verify glossary work/cache.json work/glossary.locked.json
+python -m verify completeness work/cache.json -o work/gaps.json
 ```
+
+## 3 Translation Modes
+
+| Mode | Speed | Quality | When |
+|------|-------|---------|------|
+| **A. Manual** | Slow | Highest | Single episode, complex content |
+| **B. Auto** (--auto) | Fast | Good | Sound effects + short phrases auto, agent fills rest |
+| **C. Hybrid** (auto + subagent) | Fastest | High | Multi-episode series, parallel subagents |
 
 ## Features
 
-- **Format-safe**: SRT/ASS/VTT/SUB/SMI/LRC — preserves timing, styling, drawing, karaoke
-- **Glossary**: Wikipedia API auto-lookup + agent webfetch fallback
-- **Multi-region**: zh-tw/cn/hk, pt-pt/br, en-us/uk, etc.
-- **Extract softsubs**: ffmpeg-based extraction from MKV/MP4
-- **Verify**: CPD checks, line length, glossary compliance, format integrity
+- **Format-safe**: SRT/ASS/VTT/SUB/SMI/LRC — timing, styles, karaoke, drawings preserved
+- **Context-aware**: `--context military/medical/casual/auto` — disambiguates "fire" (開火 vs 火燭)
+- **Market-aware CPS**: `--market nordic(14)/western(12)/asia(10)` — reading speed per region
+- **Bilingual export**: `--bilingual` — source + translation per segment
+- **Glossary update**: `glossary update` — scan cache for new names, Wikipedia merge
+- **Prompt builder**: `prompt_builder.py` — standardized subagent instructions
+- **Japanese support**: 80+ JP common phrases, medical terms, sound effects
+- **CJK-aware**: `cjk_visual_len()` — Chinese chars count as 2 visual units
+- **Credit footer**: SRT files get `# AI-translated by subbridge` at end
+- **Auto-validation**: batch write auto-fixes list→string subagent bugs
+- **Softsub extraction**: ffmpeg-based from MKV/MP4
 
 ## Project Structure
 
 ```
-subBridge-skill/
-├── SKILL.md                 # Full skill documentation
-├── subbridge/               # Python modules
-│   ├── parse.py             # Format-specific subtitle parser
-│   ├── export.py            # Template-synthesis exporter
-│   ├── batch.py             # Translation batch read/write
-│   ├── glossary.py          # Discover + Wikipedia fetch + lock
-│   ├── detect.py            # Language & encoding detection
-│   ├── verify.py            # Quality + integrity checks
-│   ├── extract.py           # Softsub extraction from video
-│   └── convert.py           # Format conversion
-├── examples/
-│   └── translate_batch.py   # Batch translation helper
+├── SKILL.md                     # Full documentation
+├── subbridge/
+│   ├── parse.py                 # Subtitle parser (6 formats)
+│   ├── export.py                # Exporter (bilingual, credit footer)
+│   ├── batch.py                 # Batch read/write (auto-fix validation)
+│   ├── glossary.py              # Discover + fetch + lock + update
+│   ├── auto_translate.py        # Context-aware auto-translate engine
+│   ├── prompt_builder.py        # Standardized subagent prompt generator
+│   ├── verify.py                # Quality + completeness + integrity
+│   ├── detect.py                # Language/encoding detection
+│   ├── extract.py               # Softsub extraction
+│   ├── convert.py               # Format conversion
+│   └── helpers.py               # Shared utilities
 └── references/
-    ├── translation_rules.md
-    └── region_profiles.json
+    └── subagent_prompt_template.md
 ```
 
 ## Requirements
 
-- pysubs2 (subtitle parsing)
-- httpx (Wikipedia API)
-- chardet (encoding detection)
+- pysubs2 (parsing), httpx (Wikipedia API), chardet (encoding)
 - ffmpeg (optional, for softsub extraction)
 
 ## License
