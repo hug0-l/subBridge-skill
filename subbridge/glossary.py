@@ -346,9 +346,11 @@ def cmd_fetch(args):
         ],
         "regions": [],
         "rules": [
-            {"type": "line_max_chars", "value": 42},
+            {"type": "line_max_chars", "value": 36},
             {"type": "line_max_count", "value": 2},
-            {"type": "cps_max", "value": 15},
+            {"type": "cps_max", "value": 12},
+            {"type": "min_duration_s", "value": 1.0},
+            {"type": "max_duration_s", "value": 6.0},
         ],
         "metadata": {
             "glossary_version": "1.0",
@@ -426,6 +428,141 @@ def _looks_like_name(word: str) -> bool:
     return bool(re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$", word))
 
 
+# ── Glossary Update ──────────────────────────────────────────
+
+def _existing_keys(glossary: dict) -> set:
+    """Collect all existing canonical names and aliases."""
+    keys = set()
+    for c in glossary.get("characters", []):
+        keys.add(c["canonical"].lower())
+        for a in c.get("aliases", []):
+            keys.add(a.lower())
+    for t in glossary.get("terms", []):
+        keys.add(t["src"].lower())
+    return keys
+
+
+def cmd_update(args):
+    """Update existing glossary with new candidates from cache."""
+    # Load existing glossary
+    if not os.path.exists(args.glossary):
+        print(f"Error: glossary not found: {args.glossary}", file=sys.stderr)
+        sys.exit(1)
+    with open(args.glossary, "r", encoding="utf-8") as f:
+        glossary = json.load(f)
+
+    existing = _existing_keys(glossary)
+
+    # Extract new candidates from cache
+    cache = load_cache(args.cache)
+    segments = cache.get("segments", [])
+    all_text = "\n".join(
+        re.sub(r"\{[^}]*\}", "", s.get("source_text", ""))
+        for s in segments
+    )
+    all_text = re.sub(r"<[^>]*>", "", all_text)
+    all_text = re.sub(r"\\[Nn]", " ", all_text)
+
+    # Find capitalized words/phrases not in glossary
+    candidates = set()
+    for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", all_text):
+        word = m.group().strip()
+        if word.lower() not in existing and len(word) >= 3:
+            candidates.add(word)
+
+    # Filter common sentence starters
+    stop = {"You", "Don", "Let", "Get", "Now", "Just", "One",
+            "Sit", "Wait", "Sure", "Hi", "Ma", "Mr", "Sir",
+            "Hello", "Sorry", "Please", "Thanks", "Well", "So",
+            "Go", "Come", "See", "Know", "Look", "Think", "Say",
+            "Yeah", "Yes", "No", "Oh", "Hey", "Wow", "Man",
+            "God", "Jesus", "Christ", "Damn", "Shit", "Fuck"}
+    candidates = {c for c in candidates if c.split()[0] not in stop}
+    # Remove single-letter
+    candidates = {c for c in candidates if len(c) >= 3}
+
+    if not candidates:
+        print("No new candidates found", file=sys.stderr)
+        print(json.dumps({"updated": False, "new_candidates": 0}))
+        return
+
+    print(f"Found {len(candidates)} new candidate(s)", file=sys.stderr)
+    for c in sorted(candidates)[:20]:
+        print(f"  - {c}", file=sys.stderr)
+    if len(candidates) > 20:
+        print(f"  ... and {len(candidates) - 20} more", file=sys.stderr)
+
+    # Try Wikipedia fetch for new candidates
+    new_entries = {"characters": [], "terms": []}
+    if args.source_lang and HAS_HTTPX:
+        client = httpx.Client(headers={
+            "User-Agent": "subtitle-translate/1.0 (opencode skill)",
+        }, follow_redirects=True)
+        api_lang = "zh" if args.target_lang == "zh" else args.target_lang
+        for cand in sorted(candidates)[:args.limit]:
+            result = wiki_search(args.source_lang, cand, client)
+            pages = _extract_pages(result)
+            if pages:
+                titles = "|".join(p["title"] for p in pages[:3])
+                ll_result = wiki_langlinks(args.source_lang, titles, api_lang, client)
+                for page_id, page_data in _parse_query_pages(ll_result).items():
+                    langlinks = page_data.get("langlinks", [])
+                    if langlinks:
+                        ll = langlinks[0]
+                        target_title = ll.get("*") or ll.get("title", "")
+                        is_name = _looks_like_name(cand)
+                        entry = {
+                            "canonical": cand, "render": target_title,
+                            "region": {args.region: target_title} if args.region else {},
+                            "aliases": [cand],
+                            "sources": [{"type": "wikipedia", "confidence": "medium"}],
+                        }
+                        if is_name:
+                            entry["gender"] = "-"
+                            entry["note"] = ""
+                            new_entries["characters"].append(entry)
+                        else:
+                            new_entries["terms"].append({
+                                "src": cand, "dst": target_title,
+                                "region": {args.region: target_title} if args.region else {},
+                                "category": "term", "keep_source": False,
+                            })
+                        break
+            else:
+                pass  # No Wikipedia article, skip
+        client.close()
+
+    # Merge into existing glossary
+    existing_names = {c["canonical"].lower() for c in glossary.get("characters", [])}
+    existing_terms = {t["src"].lower() for t in glossary.get("terms", [])}
+    for c in new_entries["characters"]:
+        if c["canonical"].lower() not in existing_names:
+            glossary.setdefault("characters", []).append(c)
+            existing_names.add(c["canonical"].lower())
+    for t in new_entries["terms"]:
+        if t["src"].lower() not in existing_terms:
+            glossary.setdefault("terms", []).append(t)
+            existing_terms.add(t["src"].lower())
+
+    # Update metadata
+    glossary.setdefault("metadata", {})["updated_at"] = (
+        __import__("datetime").datetime.now().isoformat())
+    glossary["metadata"]["total_entries"] = (
+        len(glossary.get("characters", [])) + len(glossary.get("terms", [])))
+
+    out = args.out or args.glossary
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(glossary, f, ensure_ascii=False, indent=2)
+
+    print(f"Updated: {out}", file=sys.stderr)
+    print(f"  Characters: {len(glossary.get('characters', []))}", file=sys.stderr)
+    print(f"  Terms: {len(glossary.get('terms', []))}", file=sys.stderr)
+    print(json.dumps({
+        "updated": True, "new_characters": len(new_entries["characters"]),
+        "new_terms": len(new_entries["terms"]), "new_candidates": len(candidates),
+    }))
+
+
 # ── CLI ────────────────────────────────────────────────────────
 
 
@@ -453,6 +590,15 @@ def main(argv=None):
     l.add_argument("--input", "-i", required=True, help="Populated glossary JSON")
     l.add_argument("--out", "-o", help="Output locked file (default: overwrite input)")
 
+    u = sub.add_parser("update", help="Update existing glossary with new cache candidates")
+    u.add_argument("--glossary", "-g", required=True, help="Existing glossary.locked.json")
+    u.add_argument("--cache", "-c", required=True, help="Cache.json with new segments")
+    u.add_argument("--source-lang", default="en", help="Source language for Wikipedia lookup")
+    u.add_argument("--target-lang", default="zh", help="Target language for Wikipedia lookup")
+    u.add_argument("--region", default="", help="Target region variant")
+    u.add_argument("--out", "-o", help="Output path (default: overwrite input)")
+    u.add_argument("--limit", type=int, default=30, help="Max Wikipedia lookups")
+
     args = ap.parse_args(argv)
     if args.command == "fetch" and not args.candidates and not args.cache:
         ap.error("fetch requires --candidates or --cache")
@@ -462,6 +608,8 @@ def main(argv=None):
         cmd_fetch(args)
     elif args.command == "lock":
         cmd_lock(args)
+    elif args.command == "update":
+        cmd_update(args)
 
 
 if __name__ == "__main__":

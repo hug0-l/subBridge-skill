@@ -461,6 +461,12 @@ def main(argv=None):
     ap.add_argument("--source-lang", default="", help="Source language code")
     ap.add_argument("--target-lang", default="", help="Target language code")
     ap.add_argument("--region", default="", help="Target region variant")
+    ap.add_argument("--context", default="auto",
+                    choices=["military", "medical", "casual", "auto"],
+                    help="Context for disambiguation (default: auto-infer)")
+    ap.add_argument("--market", default="asia",
+                    choices=["nordic", "western", "asia"],
+                    help="Target market for CPS: nordic(14), western(12), asia(10)")
     ap.add_argument("--encoding", default="", help="File encoding (auto-detect if empty)")
     args = ap.parse_args(argv)
 
@@ -504,6 +510,8 @@ def main(argv=None):
         original_encoding=enc,
         raw_header="",
     )
+    cache["context"] = args.context
+    cache["market"] = args.market
     save_cache(cache, args.out)
     print(f"Written: {args.out} ({len(segments)} segments)")
 
