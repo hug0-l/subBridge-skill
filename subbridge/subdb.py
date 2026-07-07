@@ -601,6 +601,181 @@ def _run_translation(sub_path, target_lang, region, context, market,
     return None
 
 
+# ── Multi-episode Batch ─────────────────────────────────────
+
+def _find_episodes_in_range(series_dir: str, start: int, end: int) -> list[dict]:
+    """Find video files matching episode range."""
+    episodes = []
+    for ep in range(start, end + 1):
+        pattern_1 = f"E{ep:02d}"
+        pattern_2 = f"E{ep:d}"
+        for f in sorted(os.listdir(series_dir)):
+            if not f.lower().endswith(('.mkv', '.mp4', '.avi', '.mov')):
+                continue
+            if pattern_1 in f or pattern_2 in f:
+                episodes.append({"path": os.path.join(series_dir, f), "episode": ep})
+                break
+    return episodes
+
+
+def cmd_batch(args):
+    """Process multiple episodes in one go."""
+    series_dir = args.input
+    if not os.path.isdir(series_dir):
+        print(f"Error: directory not found: {series_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    start, end = args.range.split("-")
+    start, end = int(start), int(end)
+
+    episodes = _find_episodes_in_range(series_dir, start, end)
+    if not episodes:
+        print(f"No video files found in range {start}-{end}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Found {len(episodes)} episode(s): {start}–{end}", file=sys.stderr)
+
+    pypath = os.path.join(os.path.dirname(__file__))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = pypath
+    python = sys.executable
+
+    work_dir = os.path.join(series_dir, ".subbridge_batch")
+    os.makedirs(work_dir, exist_ok=True)
+    tm_json = os.path.join(work_dir, "tm.json")
+
+    all_uncertain = []
+    episode_caches = []
+
+    # Phase 1: Parse + Auto-translate each episode
+    for ep_info in episodes:
+        video = ep_info["path"]
+        ep = ep_info["episode"]
+        ep_work = os.path.join(work_dir, f"E{ep:02d}")
+        os.makedirs(ep_work, exist_ok=True)
+
+        # Detect local subtitles
+        local = detect_local(video)
+        sub_path = None
+        if local:
+            sub_path = local[0]["path"]
+            print(f"\nE{ep:02d}: using local: {os.path.basename(sub_path)}",
+                  file=sys.stderr)
+        else:
+            embedded = detect_embedded(video)
+            if embedded:
+                out_path = os.path.join(ep_work, f"embedded.srt")
+                sub_path = _extract_embedded(video, embedded[0]["index"], out_path)
+                if sub_path:
+                    print(f"\nE{ep:02d}: extracted stream #{embedded[0]['index']}",
+                          file=sys.stderr)
+            else:
+                print(f"\nE{ep:02d}: no local or embedded subtitle found",
+                      file=sys.stderr)
+                continue
+
+        if not sub_path or not os.path.exists(sub_path):
+            continue
+
+        # Parse
+        cache_json = os.path.join(ep_work, "cache.json")
+        sp.run([python, "-m", "parse", "--input", sub_path,
+                "--source-lang", args.source_lang,
+                "--target-lang", args.target_lang,
+                "--region", args.region,
+                "--context", args.context,
+                "--market", args.market,
+                "--out", cache_json],
+               capture_output=True, env=env)
+
+        # Auto-translate
+        auto_batch = os.path.join(ep_work, "auto_batch.json")
+        uncertain_json = os.path.join(ep_work, "uncertain.json")
+        sp.run([python, "-m", "batch", "read", cache_json,
+                "--size", "3000", "--auto",
+                "--glossary", args.glossary or "",
+                "--tm", tm_json, "--tm-save", tm_json,
+                "--uncertain", uncertain_json,
+                "--context", args.context,
+                "--output", auto_batch],
+               capture_output=True, text=True, env=env)
+
+        # Write auto-batch back
+        if os.path.exists(auto_batch):
+            sp.run([python, "-m", "batch", "write", cache_json, auto_batch],
+                   capture_output=True, env=env)
+
+        # Collect uncertain
+        if os.path.exists(uncertain_json):
+            with open(uncertain_json, encoding="utf-8") as f:
+                unc = json.load(f)
+            for u in unc:
+                u["_episode"] = ep
+                u["_cache"] = cache_json
+            all_uncertain.extend(unc)
+            print(f"  → {len(unc)} uncertain segments", file=sys.stderr)
+
+        episode_caches.append({"ep": ep, "cache": cache_json, "video": video})
+
+    # Phase 2: Subagent translates all uncertain segments (if any)
+    if all_uncertain:
+        all_uncertain_path = os.path.join(work_dir, "all_uncertain.json")
+        with open(all_uncertain_path, "w", encoding="utf-8") as f:
+            json.dump(all_uncertain, f, ensure_ascii=False, indent=2)
+        print(f"\nTotal uncertain across all episodes: {len(all_uncertain)}",
+              file=sys.stderr)
+        print(f"Saved to: {all_uncertain_path}", file=sys.stderr)
+        print("Use prompt_builder to generate subagent prompt:", file=sys.stderr)
+        print(f"  python -m prompt_builder --input {all_uncertain_path} "
+              f"--output prompt.txt --context {args.context}", file=sys.stderr)
+
+        # Generate prompt file automatically
+        prompt_path = os.path.join(work_dir, "subagent_prompt.txt")
+        sp.run([python, "-m", "prompt_builder",
+                "--input", all_uncertain_path,
+                "--output", prompt_path,
+                "--context", args.context,
+                "--source-lang", args.source_lang,
+                "--target-lang", args.target_lang,
+                "--region", args.region,
+                "--market", args.market],
+               capture_output=True, text=True, env=env)
+        if os.path.exists(prompt_path):
+            print(f"Prompt: {prompt_path}", file=sys.stderr)
+    else:
+        print(f"\nAll segments auto-translated. No uncertain items.", file=sys.stderr)
+
+    # Phase 3: Export (even without subagent — auto-translated parts are done)
+    exported = []
+    for ec in episode_caches:
+        video_stem = Path(ec["video"]).stem
+        out_name = f"{video_stem}.{args.target_lang}-{args.region}.srt"
+        out_path = os.path.join(series_dir, out_name)
+
+        # Remove old
+        for f in os.listdir(series_dir):
+            if f.endswith(".srt") and f'S{args.range.split("-")[0].strip()}E{ec["ep"]:02d}' in f:
+                old_path = os.path.join(series_dir, f)
+                if old_path != out_path:
+                    try:
+                        os.remove(old_path)
+                    except OSError:
+                        pass
+
+        sp.run([python, "-m", "export", "--cache", ec["cache"],
+                "--output", out_path, "--format", "srt",
+                "--region", args.region, "--no-credit"],
+               capture_output=True, text=True, env=env)
+
+        if os.path.exists(out_path):
+            sz = os.path.getsize(out_path)
+            exported.append(f"  E{ec['ep']:02d}: {os.path.basename(out_path)} ({sz/1024:.0f}KB)")
+
+    print(f"\n── Exported ──", file=sys.stderr)
+    for e in exported:
+        print(e, file=sys.stderr)
+
+
 # ── CLI Commands ────────────────────────────────────────────
 
 def cmd_detect(args):
@@ -685,6 +860,18 @@ def main(argv=None):
     t.add_argument("--api-key", help="OpenSubtitles API key")
     t.add_argument("--glossary", help="Path to glossary.locked.json")
 
+    b = sub.add_parser("batch", help="Process multiple episodes in batch")
+    b.add_argument("--input", "-i", required=True, help="Season directory path")
+    b.add_argument("--range", "-r", required=True, help="Episode range (e.g. 1-10)")
+    b.add_argument("--source-lang", default="en", help="Source language code")
+    b.add_argument("--target-lang", default="zh", help="Target language code")
+    b.add_argument("--region", default="hk", help="Target region")
+    b.add_argument("--context", default="auto",
+                   choices=["military", "medical", "casual", "auto"])
+    b.add_argument("--market", default="asia",
+                   choices=["nordic", "western", "asia"])
+    b.add_argument("--glossary", help="Path to glossary.locked.json")
+
     args = ap.parse_args(argv)
     if args.command == "detect":
         cmd_detect(args)
@@ -692,6 +879,8 @@ def main(argv=None):
         cmd_fetch(args)
     elif args.command == "translate":
         cmd_translate(args)
+    elif args.command == "batch":
+        cmd_batch(args)
 
 
 if __name__ == "__main__":

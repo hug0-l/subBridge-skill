@@ -120,6 +120,51 @@ def _validate_translation(item: dict) -> str:
     return raw
 
 
+def _validate_translations(translations: list) -> list:
+    """Full validation pass over subagent output."""
+    validated = []
+    empty_count = 0
+    for item in translations:
+        if "text_index" not in item:
+            print(f"  ⚠ Skipped entry without text_index", file=sys.stderr)
+            continue
+        text = _validate_translation(item)
+        if not text.strip():
+            empty_count += 1
+        item["translated_text"] = text
+        validated.append(item)
+    if empty_count:
+        print(f"  ⚠ {empty_count} segment(s) have empty translations", file=sys.stderr)
+    return validated
+
+
+def _load_tm(path: str) -> dict:
+    import json as _json
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    return {"exact": {}, "version": "1.0"}
+
+
+def _save_tm(tm: dict, path: str):
+    if path:
+        import json as _json
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(tm, f, ensure_ascii=False, indent=2)
+
+
+def _tm_key(text: str) -> str:
+    """Normalize text for TM lookup."""
+    import re as _re
+    from helpers import normalize_apostrophes, strip_newline_markers
+    t = normalize_apostrophes(text)
+    t = strip_newline_markers(t)
+    t = _re.sub(r"[^\w\s]", "", t.lower())
+    t = _re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def cmd_write(args):
     cache = load_cache(args.cache)
     segments = cache.get("segments", [])
@@ -128,22 +173,46 @@ def cmd_write(args):
     with open(args.translations, "r", encoding="utf-8") as f:
         translations = json.load(f)
 
+    # Validate
+    translations = _validate_translations(translations)
+
+    # Load TM for update
+    tm = _load_tm(args.tm)
+
     applied = 0
     fixed = 0
+    tm_updated = 0
     for item in translations:
         idx = item["text_index"]
-        text = _validate_translation(item)
-        if isinstance(item.get("translated_text", ""), list):
+        text = item["translated_text"]
+        if isinstance(item.get("translated_text", ""), list) or \
+           isinstance(item.get("translated_text", ""), list):
             fixed += 1
         if idx in seg_map:
             seg_map[idx]["translated_text"] = text
             seg_map[idx]["translation_status"] = TranslationStatus.TRANSLATED
             applied += 1
 
+            # Update TM from subagent translations
+            if args.update_tm and args.tm:
+                source = seg_map[idx].get("source_text", "")
+                target = text
+                if source and target and len(source) > 3:
+                    key = _tm_key(source)
+                    tm.setdefault("exact", {})[key] = target
+                    tm_updated += 1
+
     save_cache(cache, args.cache)
+
+    # Save updated TM
+    if tm_updated > 0 and args.update_tm and args.tm:
+        _save_tm(tm, args.tm)
+
     msg = f"Applied {applied} translation(s)"
     if fixed:
         msg += f" ({fixed} auto-fixed)"
+    if tm_updated:
+        msg += f" ({tm_updated} TM entries added)"
     print(msg)
 
 
@@ -167,6 +236,9 @@ def main(argv=None):
     w = sub.add_parser("write", help="Write translated batch back")
     w.add_argument("cache", help="Path to cache.json")
     w.add_argument("translations", help="Path to translations JSON file")
+    w.add_argument("--update-tm", action="store_true",
+                   help="Update translation memory with new translations")
+    w.add_argument("--tm", help="Path to TM JSON file")
 
     args = ap.parse_args(argv)
     if args.command == "read":
