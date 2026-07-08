@@ -198,6 +198,57 @@ python parse.py ...
 
 ---
 
+## ⚠️ 嚴重警告：auto-translate ≠ full translation
+
+**auto_translate.py 只處理 Level 1（音效）+ Level 2（常用短句），覆蓋率通常 ~10-18%。**
+
+其餘 82-90% 係對話（Level 3-4），**必須經過 subagent 翻譯先係完成品**。
+
+### 錯誤案例
+
+batch 翻譯 438 部電影時，直接 auto → export，結果：
+```
+Total segments: 1109
+Auto-translated: 202 (18%)
+Untranslated: 907 (82%) → 全部係英文
+```
+檔案名 `movie.zh-hk.srt` 令人以為係完整粵語字幕，但實際 82% 內容係原文。
+
+### 正確流程
+
+```bash
+# ❌ 錯：auto → export（~18% translated）
+<PFX> -m batch read cache.json --size 1000 --auto ... --output auto_batch.json
+<PFX> -m batch write cache.json auto_batch.json
+<PFX> -m export --cache cache.json -o out.zh-hk.srt  # ← 82% 英文！
+
+# ✅ 啱：auto → subagent → export（100% translated）
+<PFX> -m batch read cache.json --size 1000 --auto ... --uncertain uncertain.json
+<PFX> -m batch write cache.json auto_batch.json
+# → subagent 翻譯 uncertain.json
+<PFX> -m batch write cache.json subagent_translations.json  # ← 補齊 82%
+<PFX> -m verify completeness cache.json   # ← 確認 100%
+<PFX> -m export --cache cache.json -o out.zh-hk.srt
+```
+
+### Pre-flight check（export 前強制檢查）
+
+`verify completeness` 必須回報 100% 先准 export：
+```bash
+# 低過 100% 就唔好 export
+<PFX> -m verify completeness cache.json
+# → {"completeness_pct": 18.0}  ← STOP! 仲有 82% 未譯
+```
+
+### 對 batch 翻譯嘅影響
+
+- auto_translate 係 **pre-processor**，唔係 translator
+- batch translate 必須包含 subagent step，否則出嚟嘅 .zh-hk.srt 係半成品
+- 用 TM 可以逐步提升 auto-translate 覆蓋率，但永遠唔會到 100%
+- **永遠永遠永遠**要行 `verify completeness` 先當完成
+
+---
+
 ## 工作流程
 
 ---
@@ -650,6 +701,134 @@ if __name__ == "__main__":
 ### 往返測試很重要
 
 正式用於新格式前，先跑一遍 `verify integrity` 確保工具鏈能無損處理該文件。ASS 的 Comment 行 / 繪圖 / K 值最容易在往返中丟失。
+
+---
+
+## ⚠️ Batch Mode 實戰教訓（v1.1 大規模批量化經驗）
+
+### 致命錯誤：auto → export 唔係完整翻譯
+
+2026年7月批次處理 438 部電影時，直接 auto_translate → export 就當完成。結果：
+```
+Total segments: 506,066
+Auto-translated: 57,216 (11.3%)
+Untranslated: 448,850 (88.7%)
+```
+檔案名 `movie.zh-hk.srt` 令人誤以為係完整粵語字幕，但實際 88% 內容係英文。
+
+**教訓：** auto_translate 係 pre-processor，唔係 translator。永遠行 `verify completeness` check 100% 先當完成。
+
+### Method A: Mixed Batch（跨電影混合批次）
+
+```
+[電影1 seg 1]    ← 唔知情節
+[電影5 seg 10]   ← 唔知情節
+[電影2 seg 3]    ← 零上下文
+```
+
+| 維度 | 結果 |
+|------|------|
+| 速度 | 快：一次 5000 seg |
+| Quality | ❌ 差：角色名混亂、風格唔一致 |
+| 語境 | ❌ 零：subagent 唔知係咩戲 |
+| 適合 | 不建議 |
+
+### Method B: Per-Movie（逐部電影獨立處理）
+
+```
+[電影1] → subagent 知道全套片嘅情節同角色
+[電影2] → subagent 知道全套片嘅情節同角色
+```
+
+| 維度 | 結果 |
+|------|------|
+| 速度 | 慢：每部電影獨立 dispatch |
+| Quality | ✅ 好：角色名一致、風格統一 |
+| 語境 | ✅ 完整：subagent 睇到全套對白 |
+| 適合 | 正式翻譯 |
+
+### 速度 vs Quality 取捨
+
+| 方法 | 438 電影需時 | Quality |
+|------|-------------|---------|
+| Mixed batch 5000 | ~4 小時 | 4/10 |
+| Per-movie full | ~40 小時 | 8/10 |
+| Auto → subagent per-movie | ~20 小時 | 7/10 |
+
+**結論：** Mixed batch 唔值得慳時間。逐部電影獨立 dispatch，每部電影的 subagent prompt 包含該電影嘅 context（片名、類型）。
+
+### `<i>` 標籤內容翻譯陷阱
+
+SIX E01-E02 大量 radio comms 用 `<i>` 包住，subagent 以為要「保留」而唔譯：
+
+```
+Before: <i>Bravo-Zero-One, this is K-Bar.</i>
+After:  <i>Bravo-Zero-One, this is K-Bar.</i>  ← ❌ 冇譯！
+```
+
+**點解發生：** 早期 prompt 寫「`<i>` tags preserved」，subagent 理解為成個 tag 連內容保留。
+
+**解決方案：** prompt 要寫明「內容 inside `<i>` 都要譯」，唔係保留成個 tag。
+
+```diff
+- <i> tags preserved
++ <i> tags: preserve the tags, TRANSLATE the content inside
++ <i>He ran</i> → <i>佢跑咗</i>
+```
+
+**驗證方法（完稿後）：**
+```bash
+python -c "
+import json
+c = json.load(open('cache.json'))
+for s in c['segments']:
+    src = s.get('source_text','').strip()
+    tgt = s.get('translated_text','').strip()
+    if src and tgt and src.lower() == tgt.lower():
+        print(f'RESIDUE #{s[\"text_index\"]}: {src[:60]}')
+"
+```
+
+搵到 source=target 嘅 segment 就係未譯嘅。
+
+### SRT 廣告/浮水印殘留
+
+OpenSubtitles download 嘅 .srt 成日有廣告尾：
+```
+Watch any video online with Open-SUBTITLES
+Free Browser extension: osdb.link/ex
+```
+
+呢啲要 auto-remove 或者 translate 做（廣告）。
+
+### Batch Translate 正確流程
+
+```bash
+# 1. Auto-translate（處理音效+短句）
+<PFX> -m batch read cache.json --size 3000 --auto --uncertain uncertain.json ...
+
+# 2. Per-movie subagent（逐部翻譯）
+# 每部電影獨立 dispatch，唔好 mixed batch
+
+# 3. Write back
+<PFX> -m batch write cache.json auto_batch.json
+<PFX> -m batch write cache.json subagent_results.json
+
+# 4. Verify 100%
+<PFX> -m verify completeness cache.json
+# → {"completeness_pct": 100.0}  ✅ 先可以 export
+
+# 5. Export
+<PFX> -m export --cache cache.json -o movie.zh-hk.srt
+```
+
+### 大規模批量化 Checklist
+
+- [ ] auto_translate 後 coverage < 20%? → 一定要行 subagent
+- [ ] Mixed batch 定 per-movie? → **一定 per-movie**
+- [ ] subagent prompt 有冇寫明「`<i>` tag 內容都要譯」? → **必須**
+- [ ] `verify completeness` 係咪 100%? → **否則唔 export**
+- [ ] Source=Target 嘅 residue check 咗未? → **必須做**
 
 
 
