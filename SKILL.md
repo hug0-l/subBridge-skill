@@ -830,6 +830,116 @@ Free Browser extension: osdb.link/ex
 - [ ] `verify completeness` 係咪 100%? → **否則唔 export**
 - [ ] Source=Target 嘅 residue check 咗未? → **必須做**
 
+---
+
+## 批量實戰總結（2026.07 大規模教訓）
+
+### 數據回顧
+
+| 指標 | 值 |
+|------|-----|
+| 處理電影 | 438 部 |
+| 處理劇集 | ~100+ 集 |
+| 總 segments | 506,066 |
+| 總翻譯 segments | ~105,000+ |
+| 使用 subagent 次數 | 250+ |
+| 寫回批次 | 180+ |
+
+### 核心教訓
+
+#### 1. `<i>` tag 內容必須翻譯，唔係保留
+
+**錯誤：** prompt 寫「`<i>` tags preserved」→ subagent 保留整個 tag 連英文內容
+**正確：** prompt 要寫「`<i>` tags: preserve the tags, TRANSLATE the content inside」
+
+SIX E01-E02 因為呢個問題有 489 段 `<i>Bravo-Zero-One</i>` 未譯。
+
+#### 2. `\N` 係換行標記，內容都要譯
+
+`\N` 係字幕換行（ASS/SSA 格式內的 line break），subagent 要保留 `\N` 但翻譯前後文字。
+
+#### 3. Auto → Export 係陷阱
+
+auto_translate 只 cover ~11%，export 前一定要行 `verify completeness`。
+
+#### 4. Mixed batch 做得，但 quality 差
+
+跨電影混合批次快但亂。Per-movie subagent 慢但穩。
+
+#### 5. Subagent output 經常有 BOM
+
+部分 subagent 輸出 UTF-8 BOM，batch write 會炒。解決方案：
+```python
+with open(path, encoding='utf-8-sig') as f:
+    data = json.load(f)
+# 再以 utf-8 重新儲存
+```
+
+#### 6. ASS drawing commands 要跳過
+
+`{\p1}...{\p0}` 係繪圖指令，唔係文字，subagent 唔應該改。Prompt 要寫明：
+```
+ASS drawing commands (\\p1...\\p0) → keep as-is
+```
+
+#### 7. Residue check 必須做
+
+完稿後要搵 source_text == translated_text 嘅 segment：
+```python
+for s in cache['segments']:
+    if s.get('source_text','').strip() == s.get('translated_text','').strip():
+        print(f'RESIDUE #{s["text_index"]}: {s["source_text"][:60]}')
+```
+
+#### 8. Subagent prompt 一致性至關重要
+
+| Prompt 寫法 | 結果 |
+|-------------|------|
+| `ALL. HK Cantonese.` | 最快但最易出事 |
+| Full rules with `<i>`/`\N`/ASS instructions | 穩定但長 |
+| `prompt_builder.py` 生成 | 標準化、可重複 |
+
+**推薦：** 用 `prompt_builder.py` + 手動補 `<i>`/`\N` clarify。
+
+### 大規模批量化建議流程
+
+```
+1. 掃描全部電影（確認缺少字幕清單）
+2. 建立共享 TM（Translation Memory）
+3. Auto-translate 全部（快速處理音效+短句）
+4. Per-movie subagent dispatch（逐部獨立翻譯）
+   └─ 每次 3-4 部 parallel
+   └─ prompt 包含：<i>翻譯、\N保留、ASS跳過
+5. Write back → prep next → 循環
+6. Completeness check（100% 先行 export）
+7. Source=Target residue check（補漏）
+8. Export .zh-hk.srt（跟原始影片檔名）
+```
+
+**驗證命令：**
+```bash
+# 完整性
+<PFX> -m verify completeness cache.json | grep completeness_pct
+
+# Residue
+python -c "
+import json
+c = json.load(open('cache.json'))
+bad = [s for s in c['segments'] if s.get('source_text','').strip() == s.get('translated_text','').strip() and s.get('source_text','').strip()]
+print(f'{len(bad)} residue segments')
+for s in bad[:3]:
+    print(f'  #{s[\"text_index\"]}: {s[\"source_text\"][:60]}')
+"
+
+# 最終覆蓋率
+python -c "
+import json
+c = json.load(open('cache.json'))
+segs = c['segments']
+done = sum(1 for s in segs if s.get('translated_text','').strip() and s.get('translated_text','').strip() != s.get('source_text','').strip())
+print(f'{done}/{len(segs)} ({done*100//len(segs)}%)')
+"
+```
 
 
 **Q: 翻譯後時間碼變了？**
