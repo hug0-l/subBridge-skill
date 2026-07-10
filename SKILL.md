@@ -566,6 +566,92 @@ ffmpeg -i episode.mkv -map 0:s:0 "episode.srt"
 # 之後 export 用返同一個 basename + .zh-hk.srt
 ```
 
+# ASR Workflow — 語音轉字幕
+
+## ASR + 翻譯完整流程
+
+```mermaid
+graph LR
+    A[Video.mkv] --> B[ASR: extract asr]
+    B --> C[Raw .srt]
+    C --> D[Parse + TM]
+    D --> E[Collect unique texts]
+    E --> F[Agent translates]
+    F --> G[Export .zh-hk.srt]
+```
+
+## 單行命令（ASR → parse → collect 一步搞掂）
+
+```bash
+python -m asr_pipeline --input episode.mkv --language ja
+
+# Output:
+#   episode.srt          ← ASR raw
+#   episode.zh-hk.srt    ← translated
+#   work/unique.json     ← agent 翻譯呢個
+```
+
+之後 agent 譯完 `unique.json`，apply + export：
+
+```bash
+python -m workflow apply --cache work/cache.json --tm work/unique.json
+python -m workflow verify --cache work/cache.json
+python -m workflow export --cache work/cache.json --output episode.zh-hk.srt
+```
+
+## 直接 ASR（唔翻譯）
+
+```bash
+# CPU + fast
+python -m extract asr --input episode.mkv --language ja
+
+# GPU + 高準確度
+python -m extract asr --input episode.mkv \
+  --backend whisperx --model large-v3-turbo \
+  --device cuda --language ja
+
+# GPU + 說話人標籤
+python -m extract asr --input episode.mkv \
+  --backend whisperx --model large-v3-turbo \
+  --device cuda --language ja \
+  --diarize --hf-token YOUR_TOKEN
+
+# 指定 output path
+python -m extract asr --input episode.mkv --language ja \
+  --output work/episode.srt
+```
+
+## 支援語言
+
+Whisper 原生支援 **99 種語言**。常用：
+
+| 語言 | --language | Whisper 支援度 |
+|------|-----------|---------------|
+| 日本語 | `ja` | 🟢 最高 |
+| English | `en` | 🟢 最高 |
+| 普通話 | `zh` | 🟢 高 |
+| 한국어 | `ko` | 🟢 高 |
+| Français | `fr` | 🟢 高 |
+| Deutsch | `de` | 🟢 高 |
+| 其他 93 種 | auto-detect | 🟡 中等 |
+
+**注意：** ASR 只做 transcription，翻譯係後續 pipeline 嘅事。
+source 係日文 → `--language ja` → ASR 出日文 SRT → parse + translate → 繁體中文
+
+## 依賴
+
+```bash
+# CPU ASR（推薦，任何電腦用得）
+pip install faster-whisper
+
+# GPU ASR（NVIDIA only，更高準確度）
+pip install whisperx
+
+# ASR Pipeline 唔需要額外安裝
+# 全靠 faster-whisper / whisperx
+```
+
+
 # 從影片提取內嵌字幕
 
 若字幕嵌在 MKV/MP4 等影片容器中（softsub），先提取再翻譯：

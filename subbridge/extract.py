@@ -458,34 +458,64 @@ def cmd_asr(args):
         print(f"Error: file not found: {video_path}", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = args.output_dir or os.path.dirname(video_path)
+    # Auto-detect device
+    if args.device is None:
+        try:
+            import torch
+            args.device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            args.device = "cpu"
+
+    # Auto-pick model
+    if args.model is None:
+        args.model = "base" if args.device == "cpu" else "large-v3-turbo"
+
+    # Auto-pick compute type
+    if args.compute_type is None:
+        args.compute_type = "int8" if args.device == "cpu" else "float16"
+
+    # Determine output path
+    if args.output:
+        srt_out = args.output
+        output_dir = os.path.dirname(srt_out) or "."
+        base = os.path.splitext(os.path.basename(srt_out))[0]
+    else:
+        output_dir = args.output_dir or os.path.dirname(video_path)
+        base = os.path.splitext(os.path.basename(video_path))[0]
+        srt_out = os.path.join(output_dir, f"{base}.srt")
+
+    os.makedirs(output_dir, exist_ok=True)
 
     # Step 1: Extract audio
-    audio_path, base = _extract_audio(video_path)
+    audio_path, _ = _extract_audio(video_path)
 
     # Step 2: Run selected backend
     try:
         if args.backend == "whisperx":
-            srt_path, lang, seg_count = cmd_asr_whisperx(args, audio_path, base, output_dir)
+            _, lang, seg_count = cmd_asr_whisperx(args, audio_path, base, output_dir)
         else:
-            srt_path, lang, seg_count = cmd_asr_faster(args, audio_path, base, output_dir)
+            _, lang, seg_count = cmd_asr_faster(args, audio_path, base, output_dir)
     finally:
-        # Cleanup temp audio
         try:
             os.remove(audio_path)
         except OSError:
             pass
 
-    print(f"\nOutput: {srt_path}", file=sys.stderr)
+    # Rename the auto-generated srt to our desired path
+    generated = os.path.join(output_dir, f"{base}.asr.srt")
+    if os.path.exists(generated) and generated != srt_out:
+        os.rename(generated, srt_out)
+
+    print(f"\nOutput: {srt_out}", file=sys.stderr)
     print(f"Segments: {seg_count}", file=sys.stderr)
     print(f"Language: {lang}", file=sys.stderr)
 
-    # Output machine-readable JSON
     output = {
-        "output_path": srt_path,
+        "output_path": srt_out,
         "segments": seg_count,
         "language": lang,
         "backend": args.backend,
+        "model": args.model,
     }
     print(json.dumps(output, ensure_ascii=False))
 
@@ -517,17 +547,20 @@ def main(argv=None):
 
     asr = sub.add_parser("asr", help="Generate subtitles via ASR")
     asr.add_argument("--input", "-i", required=True, help="Video file path")
+    asr.add_argument("--output", "-o", default=None,
+                     help="Output .srt path (default: video file path + .srt)")
     asr.add_argument("--backend", choices=["whisperx", "faster-whisper"],
                      default="faster-whisper",
                      help="ASR backend: whisperx (NVIDIA GPU, accurate) or "
                           "faster-whisper (CPU/AMD, lightweight)")
-    asr.add_argument("--model", default="tiny",
-                     help="Whisper model size (tiny/base/small/medium/large-v2/large-v3). "
-                          "Use tiny/base for CPU, large-v2 for GPU.")
-    asr.add_argument("--device", default="cpu",
-                     help="Device: cpu, cuda, auto")
-    asr.add_argument("--compute-type", default="int8",
-                     help="Compute type: int8 (CPU), float16 (GPU), float32")
+    asr.add_argument("--model", default=None,
+                     help="Model size (tiny/base/small/medium/large-v2/large-v3) "
+                          "or HuggingFace model ID. Default: base (CPU), large-v3-turbo (GPU)")
+    asr.add_argument("--device", default=None,
+                     help="Device: cpu, cuda, auto (default: auto-detect)")
+    asr.add_argument("--compute-type", default=None,
+                     help="Compute type: int8 (CPU), float16 (GPU), float32 "
+                          "(default: auto-pick)")
     asr.add_argument("--batch-size", type=int, default=16,
                      help="Batch size for inference (whisperx only)")
     asr.add_argument("--language", default=None,

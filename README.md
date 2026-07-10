@@ -122,6 +122,30 @@ graph TD
 5. **Dedup before translate** — OP/ED repeats 30-110× per series, translate once
 6. **Fix names post-translate** — DeepL mangles character names, always post-process
 
+## ASR Pipeline (Speech → Translation)
+
+```bash
+# One command: ASR + parse + collect unique texts
+python -m asr_pipeline --input episode.mkv --language ja
+
+# Output: episode.srt (ASR) + work/unique.json (for agent)
+```
+
+### Backends
+
+| Backend | Hardware | Speed | Accuracy | Model |
+|---------|----------|-------|----------|-------|
+| `faster-whisper` | CPU / any | ⚡ Fast | 🟡 Good | `tiny`/`base`/`small` |
+| `whisperx` | NVIDIA GPU | 🐢 Slow | 🟢 High | `large-v3-turbo` |
+
+### Direct ASR (no translation)
+
+```bash
+python -m extract asr --input episode.mkv --language ja
+python -m extract asr --input episode.mkv --language en --model base
+python -m extract asr --input episode.mkv --backend whisperx --model large-v3-turbo
+```
+
 ## Features
 
 - **Format-safe**: SRT/ASS/VTT/SUB/SMI/LRC — timing, styles, karaoke, drawings preserved
@@ -143,7 +167,8 @@ graph TD
 ├── README.md                     # This file
 ├── SKILL.md                      # Full documentation (1900+ lines)
 ├── subbridge/
-│   ├── workflow.py               # Mode A/C agent workflow (NEW)
+│   ├── workflow.py               # Mode A/C agent workflow
+│   ├── asr_pipeline.py           # ASR → parse → translate pipeline
 │   ├── parse.py                  # Subtitle parser (6 formats)
 │   ├── export.py                 # Exporter (bilingual, credit footer)
 │   ├── batch.py                  # Batch read/write
