@@ -216,11 +216,70 @@ def cmd_write(args):
     print(msg)
 
 
+def cmd_read_translated(args):
+    """Read TRANSLATED (status=1) segments for polish pass."""
+    cache = load_cache(args.cache)
+    segments = cache.get("segments", [])
+    size = args.size
+
+    translated = [
+        s for s in segments
+        if s.get("translation_status") == TranslationStatus.TRANSLATED
+        and s.get("translated_text", "").strip()
+    ]
+
+    batch = translated[:size]
+    result = [
+        {
+            "text_index": s["text_index"],
+            "source_text": s["source_text"],
+            "translated_text": s["translated_text"],
+        }
+        for s in batch
+    ]
+
+    remaining = max(0, len(translated) - size)
+    output_str = json.dumps(result, ensure_ascii=False, indent=2)
+
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(output_str)
+            f.write("\n")
+        print(f"Translated batch: {len(result)} segments, {remaining} remaining", file=sys.stderr)
+        print(f"Written: {args.output}", file=sys.stderr)
+    else:
+        print(f"Translated batch: {len(result)} segments, {remaining} remaining")
+        print(output_str)
+
+
+def cmd_polish(args):
+    """Write polish pass output, setting status to POLISHED."""
+    cache = load_cache(args.cache)
+    segments = cache.get("segments", [])
+    seg_map = {s["text_index"]: s for s in segments}
+
+    with open(args.polish, "r", encoding="utf-8") as f:
+        polish_items = json.load(f)
+
+    applied = 0
+    for item in polish_items:
+        idx = item.get("text_index")
+        text = item.get("polished_text") or item.get("translated_text", "")
+        if idx in seg_map:
+            seg_map[idx]["translated_text"] = text
+            seg_map[idx]["translation_status"] = TranslationStatus.POLISHED
+            applied += 1
+
+    save_cache(cache, args.cache)
+    print(f"Applied {applied} polish(es)")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Batch read/write translations")
     sub = ap.add_subparsers(dest="command", required=True)
 
-    r = sub.add_parser("read", help="Read untranslated batch")
+    r = sub.add_parser("read", help="Read untranslated batch (status=0)")
     r.add_argument("cache", help="Path to cache.json")
     r.add_argument("--size", type=int, default=100, help="Batch size")
     r.add_argument("--output", "-o", help="Write batch to file instead of stdout")
@@ -233,12 +292,21 @@ def main(argv=None):
                     choices=["military", "medical", "casual", "auto"],
                     help="Context for disambiguation (default: auto-infer)")
 
-    w = sub.add_parser("write", help="Write translated batch back")
+    w = sub.add_parser("write", help="Write translated batch back (status→1)")
     w.add_argument("cache", help="Path to cache.json")
     w.add_argument("translations", help="Path to translations JSON file")
     w.add_argument("--update-tm", action="store_true",
                    help="Update translation memory with new translations")
     w.add_argument("--tm", help="Path to TM JSON file")
+
+    p = sub.add_parser("read-translated", help="Read TRANSLATED batch for polish (status=1)")
+    p.add_argument("cache", help="Path to cache.json")
+    p.add_argument("--size", type=int, default=100, help="Batch size")
+    p.add_argument("--output", "-o", help="Write batch to file")
+
+    l = sub.add_parser("polish", help="Write polish pass output (status→2)")
+    l.add_argument("cache", help="Path to cache.json")
+    l.add_argument("polish", help="Path to polish JSON file")
 
     args = ap.parse_args(argv)
     if args.command == "read":
@@ -248,6 +316,10 @@ def main(argv=None):
             cmd_read(args)
     elif args.command == "write":
         cmd_write(args)
+    elif args.command == "read-translated":
+        cmd_read_translated(args)
+    elif args.command == "polish":
+        cmd_polish(args)
 
 
 if __name__ == "__main__":

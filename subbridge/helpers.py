@@ -22,6 +22,8 @@ SEGMENT_KEYS = [
 class TranslationStatus:
     UNTRANSLATED = 0
     TRANSLATED = 1
+    POLISHED = 2
+    EXCLUDED = 7
 
 
 def make_cache_path(work_dir: str) -> str:

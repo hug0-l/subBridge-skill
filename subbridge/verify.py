@@ -7,6 +7,8 @@ import random
 import re
 import sys
 
+from helpers import TranslationStatus
+
 
 def has_cjk(text):
     return bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]', text))
@@ -200,7 +202,7 @@ def cmd_alignment(args):
 
 
 def cmd_completeness(args):
-    """Check if all segments in cache have translations."""
+    """Check if all segments in cache have translations. Reports by status."""
     cache_path = args.cache
     if not os.path.isfile(cache_path):
         print(f"Cache not found: {cache_path}", file=sys.stderr)
@@ -211,25 +213,19 @@ def cmd_completeness(args):
 
     segs = cache.get("segments", [])
     total = len(segs)
-    translated = 0
-    empty_target = 0
+    untranslated = sum(1 for s in segs if s.get("translation_status") == TranslationStatus.UNTRANSLATED)
+    translated = sum(1 for s in segs if s.get("translation_status") == TranslationStatus.TRANSLATED)
+    polished = sum(1 for s in segs if s.get("translation_status") == TranslationStatus.POLISHED)
+    excluded = sum(1 for s in segs if s.get("translation_status") == TranslationStatus.EXCLUDED)
+    done = translated + polished
 
-    for s in segs:
-        src = s.get("source_text", "").strip()
-        tgt = s.get("translated_text", "").strip()
-
-        if not src:
-            continue
-        if tgt:
-            translated += 1
-        else:
-            empty_target += 1
-
-    pct = (translated / max(total, 1)) * 100
+    pct = (done / max(total - excluded, 1)) * 100
     print(json.dumps({
         "total": total,
+        "untranslated": untranslated,
         "translated": translated,
-        "empty": empty_target,
+        "polished": polished,
+        "excluded": excluded,
         "completeness_pct": round(pct, 1),
     }, ensure_ascii=False))
 

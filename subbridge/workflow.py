@@ -17,6 +17,8 @@ import json, os, re, subprocess, sys
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(SKILL_DIR, "subbridge"))
 
+from helpers import TranslationStatus
+
 cn = re.compile(r'[\u4e00-\u9fff\u3000-\u303f]')
 keep_as_is = re.compile(
     r'(Noctu|Aude|Fraetor|Tia|Freyre|Papilliodya|Murowa|Unity|'
