@@ -21,7 +21,7 @@ graph TB
         DEDUP --> CHOICE{Unique texts?}
         CHOICE -->|<50| MA[Mode A: manual batch]
         CHOICE -->|50-500| MC[Mode C: agent bulk]
-        CHOICE -->|>500| D{DeepL?}
+        CHOICE -->|>500| D{"DeepL?"}
         D -->|Yes| DL[DeepL batch]
         D -->|No| MC2[Mode C multi-batch]
         MA --> WRITE[Write to cache]
@@ -30,11 +30,11 @@ graph TB
         MC2 --> WRITE
     end
     subgraph QC
-        WRITE --> COMP[completeness 100%?]
+        WRITE --> COMP{Complete?<br/>100 percent}
         COMP -->|No| FIX[Fix empty]
-        COMP -->|Yes| REAL[has_cjk(tgt)?]
+        COMP -->|Yes| REAL{"Has CJK?<br/>not same as src"}
         REAL -->|Fail| REDO[Retranslate]
-        REAL -->|Pass| ALIGN[EN=ZH count?]
+        REAL -->|Pass| ALIGN{"EN vs ZH<br/>count match?"}
         ALIGN -->|Pass| EXP[Export .zh-hk.srt]
     end
 ```
@@ -85,11 +85,11 @@ python -m batch write work/cache.json work/translations_001.json
 
 ```mermaid
 graph LR
-    UNIQ{Unique texts?} -->|<50| A[Mode A: Manual<br/>50 segs per turn]
-    UNIQ -->|50-500| C[Mode C: Agent bulk<br/>all unique at once]
-    UNIQ -->|>500| D{DeepL?}
-    D -->|Yes| DL[DeepL batch<br/>+ post-process]
-    D -->|No| C2[Mode C: multi-batch<br/>200 per turn]
+    U{Unique<br/>texts?} -->|<50| A["Mode A: Manual<br/>50 segs per turn"]
+    U -->|50-500| C["Mode C: Agent bulk<br/>all unique at once"]
+    U -->|>500| D{"DeepL<br/>available?"}
+    D -->|Yes| DL["DeepL batch<br/>plus post-process"]
+    D -->|No| C2["Mode C: multi-batch<br/>200 per turn"]
 ```
 
 | Mode | Name | Engine | Best for | Quality |
@@ -102,15 +102,15 @@ graph LR
 
 ```mermaid
 graph TD
-    CACHE[Cache] --> G1{completeness 100%?}
-    G1 -->|No| F1[Fix empty]
-    G1 -->|Yes| G2{has_cjk(tgt)?<br/>tgt != src?}
-    G2 -->|No| F2[Retranslate]
-    G2 -->|Yes| G3{EN=ZH count?}
+    CACHE[Cache done] --> G1{"Complete?<br/>100 percent"}
+    G1 -->|No| F1[Fix empty segs]
+    G1 -->|Yes| G2{"Has CJK?<br/>not same as src"}
+    G2 -->|No| F2[Retranslate weak]
+    G2 -->|Yes| G3{"EN vs ZH<br/>count match?"}
     G3 -->|No| F3[Fix alignment]
-    G3 -->|Yes| G4{CPS ≤ 10?}
-    G4 -->|No| F4[Shorten]
-    G4 -->|Yes| EXP[Export]
+    G3 -->|Yes| G4{"CPS ok?<br/>under 10"}
+    G4 -->|No| F4[Shorten lines]
+    G4 -->|Yes| EXP[Export .zh-hk.srt]
 ```
 
 ## Lessons Learned (99-episode production run)

@@ -97,14 +97,14 @@ graph LR
 
 ```mermaid
 graph TD
-    CACHE[Cache] --> G1{completeness<br/>100%?}
-    G1 -->|No| F1[Fix empty segments]
-    G1 -->|Yes| G2{real check<br/>has_cjk(tgt)<br/>&& tgt != src?}
-    G2 -->|No| F2[Retranslate]
-    G2 -->|Yes| G3{alignment<br/>EN count = ZH count?}
+    CACHE[Cache done] --> G1{"Complete?<br/>100 percent"}
+    G1 -->|No| F1[Fix empty segs]
+    G1 -->|Yes| G2{"Has CJK?<br/>not same as src"}
+    G2 -->|No| F2[Retranslate weak]
+    G2 -->|Yes| G3{"EN vs ZH<br/>count match?"}
     G3 -->|No| F3[Fix alignment]
-    G3 -->|Yes| G4{quality<br/>CPS ≤ 10?<br/>CPL ≤ 36?}
-    G4 -->|No| F4[Shorten long lines]
+    G3 -->|Yes| G4{"CPS ok?<br/>under 10"}
+    G4 -->|No| F4[Shorten lines]
     G4 -->|Yes| EXP[Export .zh-hk.srt]
     F1 --> G1
     F2 --> G2
