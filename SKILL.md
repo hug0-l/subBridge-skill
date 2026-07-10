@@ -9,34 +9,107 @@ description: Translate subtitle files (SRT/ASS/VTT/SUB/SMI/LRC) with format pres
 
 端到端字幕翻譯工具。支援三種翻譯模式：
 
-```
-Mode A: Manual  — Agent 逐段翻譯（最高品質）
-Mode B: Auto    — auto_translate.py 處理 Level 1-2（音效+短語），剩餘 agent 處理
-Mode C: Hybrid  — Auto + Subagent 平行翻譯（最快，適合多集/多檔案）
+| Mode | 名稱 | 引擎 | 適合場景 | Quality |
+|------|------|------|---------|---------|
+| **A** | Manual | Agent 逐段翻譯 | <50 unique texts, 最高品質 | ⭐⭐⭐⭐⭐ |
+| **B** | Auto | auto_translate.py + Agent | 音效+短語自動，剩餘 Agent 補 | ⭐⭐⭐⭐ |
+| **C** | Agent Bulk | Agent 一次過譯所有 unique texts | 50-500 unique texts, 最快 | ⭐⭐⭐⭐⭐ |
+
+### Pipeline 總圖
+
+```mermaid
+graph TB
+    subgraph Input
+        SRC[.en.srt / .ass files] --> PARSE[subbridge parse<br/>--source-lang en --region hk]
+    end
+
+    subgraph Preprocess
+        PARSE --> TM[Apply cross-TM<br/>From completed episodes]
+        TM --> DEDUP[Collect unique untranslated texts<br/>dedup by cleaned source_text]
+    end
+
+    subgraph ModeSelect
+        DEDUP --> CHOICE{Unique texts?}
+        CHOICE -->|<50| MODEA[Mode A<br/>Manual batch<br/>50 segs per turn]
+        CHOICE -->|50-500| MODEC[Mode C<br/>Agent bulk translate<br/>All unique at once]
+        CHOICE -->|>500| DEEPL{DeepL API<br/>available?}
+        DEEPL -->|Yes| DLP[DeepL batch translate<br/>+ post-process names]
+        DEEPL -->|No| MODEC2[Mode C multi-batch<br/>200 per turn]
+    end
+
+    subgraph Translate
+        MODEA --> WRITE[Write translations to cache]
+        MODEC --> WRITE
+        DLP --> WRITE
+        MODEC2 --> WRITE
+    end
+
+    subgraph QC
+        WRITE --> COMP[verify completeness<br/>100% translated?]
+        COMP -->|No| FIX[Fix empty segments]
+        FIX --> WRITE
+        COMP -->|Yes| REAL[Real check<br/>has_cjk(tgt)?<br/>tgt != src?]
+        REAL -->|Fail| REDO[Retranslate weak segments]
+        REDO --> WRITE
+        REAL -->|Pass| ALIGN[verify alignment<br/>EN vs ZH segment count]
+        ALIGN -->|Fail| AFIX[Fix alignment]
+        AFIX --> ALIGN
+    end
+
+    subgraph Output
+        ALIGN -->|Pass| EXP[export --format srt --region hk]
+        EXP --> COPY[Copy .zh-hk.srt to Z drive]
+    end
 ```
 
+### Mode A — Manual（逐段翻譯）
+
+```mermaid
+graph LR
+    READ[batch read --size 50] --> AGT[Agent 逐段翻譯]
+    AGT --> WR[batch write to cache]
+    WR --> CHECK{Remaining?}
+    CHECK -->|Yes| READ
+    CHECK -->|No| QC[QC Gate]
 ```
-[字幕檔] → parse --market --context → [cache.json]
-                                              │
-                    ┌─── batch read ──→ [Agent 手譯] ──┐
-                    │   (mode B: --auto)               │
-                    │   (mode C: --auto + subagent)    │
-                    │   (prompt_builder.py 生成 prompt)│
-                    └──────────────────────────────────┘
-                                              │
-                                  batch write → [cache.json]
-                                    (auto-fix list→string)
-                                              │
-                                  glossary update ←──┐
-                                    (scan new names)  │
-                                              │
-                                  verify completeness → [loop if gaps]
-                                              │
-                                  export --bilingual? ──┐
-                                  export --no-credit?   │
-                                              │
-                                  [譯文字幕.zh-hk.srt]
-                                    (credit footer) ← repo URL
+
+### Mode B — Auto（快速）
+
+```mermaid
+graph LR
+    AUTO[auto_translate<br/>level 1-2] --> UNCERTAIN[uncertain.json]
+    UNCERTAIN --> SUB[Subagent 翻譯 uncertain]
+    SUB --> WR[batch write]
+    WR --> QC[QC Gate]
+```
+
+### Mode C — Agent Bulk（最快，主推）
+
+```mermaid
+graph LR
+    DEDUP[Collect unique texts<br/>200-300 per episode] --> AGT[Agent translates ALL unique<br/>in one response]
+    AGT --> TMAP[Map back to all segments]
+    TMAP --> VERIFY[verify completeness]
+    VERIFY --> EXP[Export]
+```
+
+### QC Gate 詳細
+
+```mermaid
+graph TD
+    CACHE[Cache] --> G1{completeness<br/>100%?}
+    G1 -->|No| F1[Fix empty segments]
+    G1 -->|Yes| G2{real check<br/>has_cjk(tgt)<br/>&& tgt != src?}
+    G2 -->|No| F2[Retranslate]
+    G2 -->|Yes| G3{alignment<br/>EN count = ZH count?}
+    G3 -->|No| F3[Fix alignment]
+    G3 -->|Yes| G4{quality<br/>CPS ≤ 10?<br/>CPL ≤ 36?}
+    G4 -->|No| F4[Shorten long lines]
+    G4 -->|Yes| EXP[Export .zh-hk.srt]
+    F1 --> G1
+    F2 --> G2
+    F3 --> G3
+    F4 --> G4
 ```
 
 ### 支援格式
@@ -550,57 +623,80 @@ $PFX -m parse --input "$EXTRACTED" --target-lang zh --region tw --out work/cache
 
 ## 命令速查
 
+### Mode C (推薦) — Agent Bulk Workflow
+
 ```bash
-# 路徑變數
-SKILL_DIR="$HOME/.config/opencode/skills/subtitle-translate"
-PFX="PYTHONPATH=$SKILL_DIR/subbridge python"
+# 1. Parse all episodes
+python workflow.py parse --src Z:/Videos/Anime/Series/Season\ 1 --work work/
 
-# 解析（含 context + market）
-$PFX -m parse --input ep01.srt --source-lang en --target-lang zh \
-  --region hk --context military --market asia --out work/cache.json
+# 2. Apply cross-TM from completed episodes
+python workflow.py apply-tm --work work/ --tm work/tm.json
 
-# 術語表
-$PFX -m glossary discover --cache work/cache.json --source-lang en > work/candidates.json
-$PFX -m glossary fetch --candidates work/candidates.json \
-  --source-lang en --target-lang zh --region hk --out work/glossary.populated.json
-# → agent webfetch _gaps
-$PFX -m glossary lock --input work/glossary.populated.json --out work/glossary.locked.json
+# 3. Collect unique untranslated texts for agent
+python workflow.py collect --cache work/cache_ep01.json --out work/unique_ep01.json
+# → Agent 翻譯 unique_ep01.json（填 translated_text）
 
-# 術語表更新（scan cache 新名 + Wikipedia merge）
-$PFX -m glossary update --glossary work/glossary.locked.json \
-  --cache work/cache.json --source-lang en --target-lang zh --region hk
+# 4. Apply agent translations
+python workflow.py apply --cache work/cache_ep01.json --tm work/unique_ep01.json
 
-# Mode A: Agent 手譯
-$PFX -m batch read work/cache.json --size 50 --output work/batch.json
-# → agent 翻譯（或先用 prompt_builder 生成 prompt）
-$PFX -m prompt_builder --input work/batch.json --output prompt.txt \
-  --context military --bilingual
-$PFX -m batch write work/cache.json work/translations_001.json
+# 5. Verify
+python workflow.py verify --cache work/cache_ep01.json
 
-# Mode B: Auto 翻譯
-$PFX -m batch read work/cache.json --size 1000 --auto \
+# 6. Export
+python workflow.py export --cache work/cache_ep01.json --out work/ep01.zh-hk.srt
+```
+
+### Mode A — Manual Batch
+
+```bash
+# 讀取 50 段未譯
+<PFX> -m batch read work/cache.json --size 50 --output work/batch.json
+# → Agent 逐段翻譯 batch.json → 寫 translations_001.json
+<PFX> -m batch write work/cache.json work/translations_001.json
+# → Loop 直到 batch read 返回 []（100%）
+```
+
+### Mode B — Auto
+
+```bash
+<PFX> -m batch read work/cache.json --size 1000 --auto \
   --glossary work/glossary.locked.json --tm work/tm.json \
   --tm-save work/tm.json --uncertain work/uncertain.json \
   --context military --output work/auto_batch.json
-$PFX -m batch write work/cache.json work/auto_batch.json
+<PFX> -m batch write work/cache.json work/auto_batch.json
+```
 
-# 匯出（單語／雙語／credit）
-$PFX -m export --cache work/cache.json --output out/ep01.zh-hk.srt \
+### DeepL 批量翻譯（需要 API key）
+
+```python
+import deepl
+t = deepl.Translator("YOUR_AUTH_KEY:fx")
+texts = [s['source_text'] for s in untranslated]
+results = t.translate_text(texts, target_lang='ZH')
+for s, r in zip(untranslated, results):
+    s['translated_text'] = r.text
+```
+
+### 通用
+
+```bash
+# 解析
+<PFX> -m parse --input ep01.srt --source-lang en --target-lang zh \
+  --region hk --context casual --market asia --out work/cache.json
+
+# 匯出
+<PFX> -m export --cache work/cache.json --output ep01.zh-hk.srt \
   --format srt --region hk
-$PFX -m export --cache work/cache.json --output out/ep01.bilingual.srt \
-  --bilingual --bilingual-order source-first
 
 # 校驗
-$PFX -m verify quality work/cache.json --market asia
-$PFX -m verify glossary work/cache.json work/glossary.locked.json
-$PFX -m verify completeness work/cache.json --output work/gaps.json
-$PFX -m verify integrity --original ep01.srt --output out/ep01_translated.srt
+<PFX> -m verify completeness --cache work/cache.json
+<PFX> -m verify quality work/cache.json --market asia
 
-# 格式檢測
-$PFX -m detect --input ep01.srt
+# 雙語偵測
+<PFX> -m detect --deep --input ep01.ass
 
-# 格式互轉（純轉換不翻譯）
-python convert.py --input ep01.srt --output ep01.ass
+# 掃描目錄
+<PFX> -m detect --deep --scan --input Z:/Videos/Anime
 ```
 
 ---
@@ -1597,6 +1693,171 @@ subedit -i input.srt -c
 
 # OCR fix（0/O 混淆、l/I 混淆）
 subedit -i input.srt -m
+
+## 實戰教訓 v1.4 — 99 集大規模批量翻譯（2026.07）
+
+### 背景
+
+一次性翻譯 7 套動畫、99 集、~60,000 段字幕，由英文譯為香港繁體中文。涉及大量 EP 專屬對白、歌曲歌詞、拉丁咒語、角色名一致性問題。
+
+### 核心教訓
+
+#### 1. Subagent 會呃人，永遠要 verify
+
+Subagent 多次聲稱「100% 完成」但實際剩低 80-90% 英文。**不要相信 subagent 的 self-report。** 每次 subagent 完成後必須用 `check_real.py` 或 `verify completeness` 獨立驗證。
+
+```python
+# check_real.py — REAL 翻譯比率，唔係 subagent 話嗰種
+cn = re.compile(r'[\u4e00-\u9fff]')
+real = sum(1 for s in segs if s.get('translated_text','') and cn.search(s['translated_text']) and s['translated_text'] != s.get('source_text',''))
+print(f"REAL: {real}/{total}")
+```
+
+#### 2. 翻譯工具選擇
+
+| 工具 | 結果 | 結論 |
+|------|------|------|
+| subbridge auto_translate | 只 cover 10-15%（音效+短句） | 只可做 pre-process |
+| 手寫 TM dictionary | 25 集要寫 ~6000 條，逐條在 conversation 打字 | ❌ 唔 scale |
+| googletrans 4.0.0rc1 | Google 即 ban IP，httpx 版本衝突，炒 romaji | ❌ 不可用 |
+| **DeepL API** | **穩定、快、quality 好、支援繁中** | **✅ 推薦** |
+| Subagent 號稱 100% | 實際 3-20%，其餘係角色名替換 | ❌ 唔信得過 |
+
+#### 3. DeepL API 正確用法
+
+```python
+import deepl
+t = deepl.Translator(AUTH_KEY)
+
+# Batch translate (最快)
+texts = [s['source_text'].replace('\\N', '\n') for s in todo]
+results = t.translate_text(texts, target_lang='ZH')
+for s, r in zip(todo, results):
+    s['translated_text'] = r.text
+
+# Post-processing: fix character names
+for eng, cn_name in NAME_FIXES:
+    text = text.replace(eng, cn_name)
+```
+
+要點：
+- `target_lang='ZH'` 出繁體中文（DeepL 唔分 tw/hk，但「」格式靠 subbridge export --region hk）
+- Batch translate 支援一次過傳 list，快過逐句 call
+- DeepL free tier: 500K chars/month — 99 集約用 270K chars（LWA 25 eps）
+- Free tier 夠做 1-2 套完整動畫
+
+#### 4. 大量重複文本要 dedup 先譯
+
+OP/ED 歌詞每集重複 30-110 次。**先收集 unique texts 再翻譯，然後 map 返去所有 segments：**
+
+```python
+# Collect unique
+seen = {}
+for s in segs:
+    clean = src.replace('\\N', ' ').strip()
+    if clean not in seen:
+        seen[clean] = []
+    seen[clean].append(s['text_index'])
+
+# Translate unique only
+for text in seen:
+    translation = deepl_translate(text)
+    for idx in seen[text]:
+        segs[idx]['translated_text'] = translation
+```
+
+#### 5. 拉丁咒語同日文歌詞要保留原文
+
+ASS 字幕常見的 Latin spells（`Noctu Orfei`, `Aude Fraetor`）、日文 romaji 歌詞（`watashitachi wa dare datte hiiro ni nareru`）應保留原文，唔好翻譯。
+
+```python
+latin = re.compile(r'(Noctu|Aude|Fraetor|Tia|Freyre|Papilliodya|Murowa|Unity)', re.I)
+romaji = re.compile(r'^[a-z\s\'.,!?;:\-"]+$')
+for s in segs:
+    if latin.search(s['source_text']) or romaji.match(s['source_text']):
+        s['translated_text'] = s['source_text']  # keep as-is
+```
+
+#### 6. 雙語 ASS 偵測不可靠
+
+大量 PopSub 風格 ASS 檔案包含 `InsCN`/`OPCN`/`EDCN` 樣式，同一 .ass 內有日文+中文。`detect.py` 的 `guess_language()` 只回報**主導語言**（日文漢字 → `ja`），完全忽略中文 tracks。
+
+解決方案：`detect.py --deep` 模式檢查 Style 定義中的 CN 字樣、GBK/GB18030 字型編碼、Dialogue 行中的 CJK 字符。
+
+#### 7. QC 流程必須自動化
+
+每集做完必須行以下 checks：
+
+```
+1. check_real.py      — translated_text 有 CJK？唔等於 source_text？
+2. verify completeness — cache 層面 100%？
+3. verify alignment    — EN/ZH SRT 段數一致？
+4. 抽樣睇 content     — 有冇成段英文殘留？
+```
+
+QC 重點：**睇 REAL，唔睇 CLAIMED。** subagent 話 100% = 0，DeepL translate count = ?，`cn.search(tgt)` = 真相。
+
+#### 8. 角色名一致性
+
+DeepL 會將角色名翻譯成唔同版本。必須 post-process 強制修正：
+
+```python
+NAME_FIXES = [
+    ("Akko", "亞可"), ("Diana", "黛安娜"), ("Chariot", "夏莉歐"),
+    ("Luna Nova", "露娜諾瓦"), ("Shiny Rod", "閃耀魔杖"),
+    # ... 全部角色
+]
+for eng, cn_name in sorted(NAME_FIXES, key=lambda x: -len(x[0])):
+    text = text.replace(eng, cn_name)
+```
+
+#### 9. 檔案清理要小心
+
+大量舊 subagent 檔案與新 DeepL 檔案衝突。**永遠用 CJK count 判斷好壞，唔好用 filename 判斷：**
+
+```python
+cn = re.compile(r'[\u4e00-\u9fff]')
+# 比較兩版本，keep CJK count 高嘅
+cn_count = len(cn.findall(content))
+```
+
+DeepL 版本 CN:EN 比例通常 >10:1，舊 subagent 版本 CN:EN 通常 <1:3。
+
+### 最終數據
+
+| 系列 | 集數 | 引擎 | 結果 |
+|------|------|------|------|
+| After the Rain (2018) | 12 | 人手 batch | ✅ 100% |
+| Blue Period (2021) | 12 | DeepL | ✅ 99% |
+| Do It Yourself!! | 12 | DeepL | ✅ 100% |
+| Great Pretender (2020) | 14 | DeepL | ✅ 100% |
+| Little Witch Academia (2017) | 25 | TM+DeepL | ✅ 97% (Latin/JP lyrics kept) |
+| Orange (2016) | 13 | DeepL | ✅ 100% |
+| SSSS.DYNAZENON (2021) | 11 | DeepL | ✅ 100% |
+| **總計** | **99** | | **99 .zh-hk.srt files** |
+
+### 數據用量
+
+DeepL Free API (500K chars/month)：
+- LWA 25 eps: ~270K chars
+- 其餘 74 eps: ~230K chars  
+- 合計 ~500K — 啱啱好夠用
+
+### 推薦工作流（經實戰驗證）
+
+```
+1.  parse ──→ cache.json
+2.  apply TM from completed episodes ──→ 10-20% coverage
+3.  collect unique untranslated texts ──→ dedup
+4.  DeepL batch translate ──→ 80-85% coverage
+5.  post-process: fix names, keep Latin/romaji
+6.  write cache
+7.  verify completeness (100%?)
+8.  export .zh-hk.srt
+9.  verify alignment (EN vs ZH)
+10. copy to Z drive
+```
+
 
 # 刪除聽障字幕
 subedit -i input.srt -k '([{'
