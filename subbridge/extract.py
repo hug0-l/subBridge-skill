@@ -288,6 +288,216 @@ def cmd_auto(args):
         print(f"  {p}")
 
 
+def _extract_audio(video_path: str) -> tuple[str, str]:
+    """Extract audio from video file. Returns (audio_path, base_name)."""
+    EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    audio_path = str(EXTRACT_DIR / f"{base}_audio.wav")
+
+    print(f"Extracting audio: {audio_path}", file=sys.stderr)
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-v", "quiet",
+        "-i", video_path,
+        "-vn", "-acodec", "pcm_s16le",
+        "-ar", "16000", "-ac", "1",
+        audio_path,
+    ]
+    result = subprocess.run(ffmpeg_cmd, capture_output=True, timeout=300)
+    if result.returncode != 0:
+        print("ffmpeg audio extraction failed.", file=sys.stderr)
+        sys.exit(1)
+    return audio_path, base
+
+
+def _write_srt(segments: list, srt_path: str) -> int:
+    """Write whisper segments to SRT file. Returns segment count."""
+    with open(srt_path, "w", encoding="utf-8") as f:
+        seg_idx = 1
+        for seg in segments:
+            start = seg.get("start", 0)
+            end = seg.get("end", 0)
+            text = seg.get("text", "").strip()
+            if not text:
+                continue
+
+            speaker = seg.get("speaker", None)
+            if speaker:
+                text = f"({speaker}) {text}"
+
+            start_ts = _ms_to_srt_timecode(int(start * 1000))
+            end_ts = _ms_to_srt_timecode(int(end * 1000))
+            f.write(f"{seg_idx}\n{start_ts} --> {end_ts}\n{text}\n\n")
+            seg_idx += 1
+    return seg_idx - 1
+
+
+def cmd_asr_whisperx(args, audio_path: str, base: str,
+                      output_dir: str) -> tuple[str, str, int]:
+    """ASR via WhisperX (NVIDIA GPU only, with alignment + optional diarization)."""
+    try:
+        import whisperx
+    except ImportError:
+        print("Error: whisperx not installed.", file=sys.stderr)
+        print("  pip install whisperx", file=sys.stderr)
+        print("  Requires: CUDA 12.8 + NVIDIA GPU (≥8GB VRAM)", file=sys.stderr)
+        sys.exit(1)
+
+    device = args.device or "cuda"
+    model_name = args.model or "large-v2"
+    compute_type = args.compute_type or "float16"
+
+    print(f"Loading WhisperX model '{model_name}' on {device}...", file=sys.stderr)
+    try:
+        asr_model = whisperx.load_model(model_name, device, compute_type=compute_type)
+    except Exception as e:
+        print(f"Failed to load model: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Transcribing...", file=sys.stderr)
+    audio = whisperx.load_audio(audio_path)
+    result = asr_model.transcribe(audio, batch_size=args.batch_size or 16)
+    detected_lang = result.get("language", args.language or "en")
+    print(f"Detected language: {detected_lang}", file=sys.stderr)
+
+    # Align
+    print("Aligning timestamps...", file=sys.stderr)
+    try:
+        align_model, align_metadata = whisperx.load_align_model(
+            language_code=detected_lang, device=device)
+        result = whisperx.align(
+            result["segments"], align_model, align_metadata,
+            audio, device, return_char_alignments=False)
+    except Exception as e:
+        print(f"Alignment skipped: {e}", file=sys.stderr)
+
+    # Diarize (optional)
+    if args.diarize:
+        if not args.hf_token:
+            print("Error: --hf-token required for diarization.", file=sys.stderr)
+            sys.exit(1)
+        print("Running speaker diarization...", file=sys.stderr)
+        try:
+            from whisperx.diarize import DiarizationPipeline
+            diarize_model = DiarizationPipeline(token=args.hf_token, device=device)
+            diarize_segments = diarize_model(audio)
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+        except Exception as e:
+            print(f"Diarization failed: {e}", file=sys.stderr)
+
+    segments = result["segments"]
+    srt_path = os.path.join(output_dir, f"{base}.asr.srt")
+    seg_count = _write_srt(segments, srt_path)
+    return srt_path, detected_lang, seg_count
+
+
+def cmd_asr_faster(args, audio_path: str, base: str,
+                    output_dir: str) -> tuple[str, str, int]:
+    """Lightweight ASR via faster-whisper (CPU / AMD GPU via OpenVINO)."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print("Error: faster-whisper not installed.", file=sys.stderr)
+        print("  pip install faster-whisper", file=sys.stderr)
+        print("  Runs on CPU or NVIDIA GPU (no CUDA toolkit needed)", file=sys.stderr)
+        sys.exit(1)
+
+    device = args.device or "cpu"
+    model_name = args.model or "tiny"
+    compute_type = args.compute_type or "int8"
+
+    # Map compute types
+    if device == "cpu":
+        compute_type = "int8"
+    elif device == "cuda":
+        compute_type = args.compute_type or "float16"
+
+    print(f"Loading faster-whisper model '{model_name}' on {device}...", file=sys.stderr)
+    try:
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    except Exception as e:
+        print(f"Failed to load model: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    language = args.language or None
+
+    print("Transcribing...", file=sys.stderr)
+    segments_gen, info = model.transcribe(
+        audio_path,
+        language=language,
+        beam_size=5,
+        vad_filter=True,
+    )
+
+    detected_lang = info.language if info else (language or "en")
+    print(f"Detected language: {detected_lang} (probability: "
+          f"{info.language_probability:.2f})", file=sys.stderr)
+
+    # faster-whisper returns generator; collect all segments
+    segments = []
+    for seg in segments_gen:
+        segments.append({
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text.strip(),
+        })
+
+    srt_path = os.path.join(output_dir, f"{base}.asr.srt")
+    seg_count = _write_srt(segments, srt_path)
+    return srt_path, detected_lang, seg_count
+
+
+def cmd_asr(args):
+    """Generate subtitles from audio using ASR."""
+    has_ffmpeg = check_tool("ffmpeg")
+    if not has_ffmpeg:
+        print("Error: ffmpeg is required for audio extraction.", file=sys.stderr)
+        sys.exit(1)
+
+    video_path = args.input
+    if not os.path.isfile(video_path):
+        print(f"Error: file not found: {video_path}", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir = args.output_dir or os.path.dirname(video_path)
+
+    # Step 1: Extract audio
+    audio_path, base = _extract_audio(video_path)
+
+    # Step 2: Run selected backend
+    try:
+        if args.backend == "whisperx":
+            srt_path, lang, seg_count = cmd_asr_whisperx(args, audio_path, base, output_dir)
+        else:
+            srt_path, lang, seg_count = cmd_asr_faster(args, audio_path, base, output_dir)
+    finally:
+        # Cleanup temp audio
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
+
+    print(f"\nOutput: {srt_path}", file=sys.stderr)
+    print(f"Segments: {seg_count}", file=sys.stderr)
+    print(f"Language: {lang}", file=sys.stderr)
+
+    # Output machine-readable JSON
+    output = {
+        "output_path": srt_path,
+        "segments": seg_count,
+        "language": lang,
+        "backend": args.backend,
+    }
+    print(json.dumps(output, ensure_ascii=False))
+
+
+def _ms_to_srt_timecode(ms: int) -> str:
+    """Convert milliseconds to SRT timecode format HH:MM:SS,mmm."""
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Extract soft subtitles from video files")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -305,6 +515,30 @@ def main(argv=None):
     a = sub.add_parser("auto", help="Extract all and output paths for import")
     a.add_argument("--input", "-i", required=True, help="Video file path")
 
+    asr = sub.add_parser("asr", help="Generate subtitles via ASR")
+    asr.add_argument("--input", "-i", required=True, help="Video file path")
+    asr.add_argument("--backend", choices=["whisperx", "faster-whisper"],
+                     default="faster-whisper",
+                     help="ASR backend: whisperx (NVIDIA GPU, accurate) or "
+                          "faster-whisper (CPU/AMD, lightweight)")
+    asr.add_argument("--model", default="tiny",
+                     help="Whisper model size (tiny/base/small/medium/large-v2/large-v3). "
+                          "Use tiny/base for CPU, large-v2 for GPU.")
+    asr.add_argument("--device", default="cpu",
+                     help="Device: cpu, cuda, auto")
+    asr.add_argument("--compute-type", default="int8",
+                     help="Compute type: int8 (CPU), float16 (GPU), float32")
+    asr.add_argument("--batch-size", type=int, default=16,
+                     help="Batch size for inference (whisperx only)")
+    asr.add_argument("--language", default=None,
+                     help="Language code (auto-detect if omitted)")
+    asr.add_argument("--diarize", action="store_true",
+                     help="Enable speaker diarization (whisperx only)")
+    asr.add_argument("--hf-token", default=None,
+                     help="HuggingFace token for diarization (whisperx only)")
+    asr.add_argument("--output-dir", default=None,
+                     help="Output directory (default: video file directory)")
+
     args = ap.parse_args(argv)
     if args.command == "list":
         cmd_list(args)
@@ -312,6 +546,8 @@ def main(argv=None):
         cmd_extract(args)
     elif args.command == "auto":
         cmd_auto(args)
+    elif args.command == "asr":
+        cmd_asr(args)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,6 @@
 pysubs2>=1.7.0
 httpx>=0.27.0
 chardet>=5.2.0
+# Optional: for extract asr command
+# whisperx>=3.1.0       # Backend: NVIDIA GPU only, accurate + diarization
+# faster-whisper>=1.1.0 # Backend: CPU/AMD GPU, lightweight

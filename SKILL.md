@@ -1,6 +1,6 @@
 ﻿---
 name: subbridge-skill
-description: Translate subtitle files (SRT/ASS/VTT/SUB/SMI/LRC) with format preservation, glossary management, and multi-region support. Triggers on "translate subtitle", "翻译字幕", "subtitle translate", "字幕翻譯", "subbridge", and similar.
+description: Translate subtitle files (SRT/ASS/VTT/SUB/SMI/LRC) with format preservation, glossary management, multi-region support, watermark/OCR cleanup, MKV embedded subtitle extraction, and WhisperX ASR integration. References GY/T 359-2022 (China AV translation standard), VCB-S collation specs, and fansub industry best practices. Triggers on "translate subtitle", "翻译字幕", "subtitle translate", "字幕翻譯", "subbridge", and similar.
 ---
 
 # subBridge 技能指南
@@ -522,6 +522,13 @@ ffmpeg -i episode.mkv -map 0:s:0 "episode.srt"
 # 提取全部（自動）
 <PFX> -m extract auto --input episode.mkv
 
+# ASR 音頻轉字幕
+<PFX> -m extract asr --input episode.mkv    # faster-whisper tiny (CPU, default)
+<PFX> -m extract asr --input episode.mkv --backend faster-whisper --model base
+<PFX> -m extract asr --input episode.mkv --backend whisperx --model large-v2  # NVIDIA GPU
+<PFX> -m extract asr --input episode.mkv --backend whisperx --diarize --hf_token YOUR_TOKEN
+<PFX> -m extract asr --input episode.mkv --language ja    # 指定語言加速
+
 # 提取後直接接續翻譯流程
 EXTRACTED=$(python extract.py auto --input episode.mkv \
   | python -c "import sys,json; d=json.load(sys.stdin); print(d[0]['output_path'])")
@@ -598,6 +605,203 @@ python convert.py --input ep01.srt --output ep01.ass
 
 ---
 
+## 實戰教訓（v1.2 — SEAL Team S07 季集修正）
+
+### 新工作流：修正已譯字幕（唔係從零翻譯）
+
+之前嘅工作流假設你由英文原檔開始翻譯。但 SEAL Team S07 嘅情況係：
+- 已有 `.zh-hk.srt`（部份翻譯，大量英文殘留，角色名唔一致）
+- 英文 `.srt` 同 `.zh-hk.srt` 嘅 **block 結構可以完全唔同**（唔同段落數、唔同 index）
+
+**錯誤做法：** 用 source `.srt` 嘅 text_index 去對應 `.zh-hk.srt` → 大量 mismatch（~10% 配對唔到）
+
+**正確做法（fix workflow）：**
+
+```
+1. 讀 .zh-hk.srt 做 source（唔用 .srt）
+2. For each block：
+   a. 有 CJK → 已經翻譯，只 fix 角色名
+   b. Speaker label（(Sonny)）→ 保留
+   c. Sound effect（[gunshot]）→ 保留
+   d. 純英文對白 → 需要翻譯
+3. Batch translate remaining English dialogue
+4. Export 直接覆蓋/取代原有 .zh-hk.srt
+```
+
+核心原則：用 target file 自己嘅 content 配對，唔好 rely on text_index 跨 file matching。
+
+### 單字元角色名替換要 CJK 邊界檢查
+
+中文角色名裏面，**單字元名最容易出事**：
+
+| 角色 | 原名 | 中文譯名 | 假陽性例 | 安全做法 |
+|------|------|---------|---------|---------|
+| Ray | 雷 | 雷 | 雷達、雷聲、地雷 | `(?<![\u4e00-\u9fff])雷(?![\u4e00-\u9fff])` |
+| Drew | 祖 | 祖 | 祖國、祖先、祖父 | `(?<![\u4e00-\u9fff])祖(?![\u4e00-\u9fff])` |
+
+**規則：** 單字元名只替換當**前後都冇 CJK 字符**。Speaker label 格式 `(雷)`、`雷：` 會自動 match；複合詞 `雷達` 唔會 match。
+
+多字元名（桑尼、積遜、布洛克）可以直接 `.replace()`，冇假陽性問題。
+
+### 分段策略：咩英文需要譯 vs 咩唔使
+
+檢查英文字幕時，唔係所有英文都等於「未翻譯」。要分類：
+
+| 類別 | 例子 | 處理 |
+|------|------|------|
+| Speaker label | `(Sonny)`, `(Ray)` | 保留，唔使譯 |
+| Sound effect | `[gunshot]`, `♪ music ♪` | 保留 |
+| 角色名對白 | `Sonny?`, `Jason...`, `Samara!` | 保留（角色名） |
+| 軍語/術語 | `Master Chief`, `Bravo 2`, `RPG!` | 建議保留，但可應要求翻譯（見 v1.4） |
+| 歌曲歌詞 | `♪ Another john... ♪` | 保留原文 |
+| 製作 credit | `Captioning sponsored by CBS` | 可保留或翻譯 |
+| 外語 quote | `<i>¿Dónde está la biblioteca?</i>` | 保留原文 |
+| 純對白 | `We need to move now.` | ✅ 需要翻譯 |
+| Recap header | `<i>Previously on</i> SEAL Team...` | ✅ 需要翻譯（統一：上集重溫） |
+
+**實戰數據（SEAL Team S07 10 集，最終狀態）：**
+- Total segments: 9,248
+- 已翻譯（CJK）：8,841 (95.6%)
+- 已補音效描述：49 段（`（man groaning）` → `（男人呻吟聲）`）
+- 已補對白：~20 段（`God forbid。` → `但願唔會。`）
+- 已補軍語：16 段（`Master Chief` → `士官長`，`TBI` → `創傷性腦損傷` 等）
+- Speaker label 保留：272 (2.9%)
+- 歌曲/音樂：~60 (0.6%)
+- **剩餘未譯對白：0（全部 intentional）**
+
+### SRT 結構不一致係大問題
+
+Source `.srt` 同 target `.zh-hk.srt` 經常出現 block 結構唔一致：
+
+```
+Source English .srt:
+  10
+  00:00:32,584 --> 00:00:35,414
+  RIVAS:
+  This would not have happened
+  without your determined resolve.
+
+Target .zh-hk.srt:
+  46
+  00:00:32,584 --> 00:00:33,757
+  (Rivas)
+
+  47
+  00:00:33,757 --> 00:00:35,414
+  This would not have happened
+```
+
+**text_index 完全唔對應**。解決方法：
+- 用 **text content matching** 代替 index matching：取首 20 chars 比較
+- 或者用 **timecode 配對**（start_ms/end_ms 重疊判斷）
+- 最穩陣：直接用 target file 做 source，唔 cross-reference
+
+### 海豹突擊隊 → SEAL 替換教訓
+
+軍劇入面，中文翻譯經常將「SEAL」譯做「海豹突擊隊」，搞到中英夾雜：
+
+| 原文 | 錯誤翻譯 | 正確翻譯 |
+|------|---------|---------|
+| `My lips are SEALed.` | `My lips are 海豹突擊隊ed.` | `My lips are SEALed.` |
+| `Just five days as a SEAL left.` | `Just five days as a 海豹突擊隊 left.` | `Just five days as a SEAL left.` |
+| `The motherfucker knows how SEALs operate.` | `The motherfucker knows how 海豹突擊隊s operate.` | `The motherfucker knows how SEALs operate.` |
+
+**規則：** 軍事/動作類型入面，「SEAL」建議保留英文，唔好強行本地化。
+
+### 實戰教訓（v1.4 — SEAL Team S07 軍語翻譯 + 精準 fix 工作流）
+
+#### 軍語翻譯嘅取捨
+
+用戶原先話「retain jargon but need readability」，後來改為「Call sign 保留，其餘翻譯」。關鍵發現：
+
+| 類別 | 例子 | 最終決定 |
+|------|------|---------|
+| Call sign | `Bravo 6`, `Bravo 2` | 保留 |
+| 軍銜 | `Master Chief` | 翻譯：士官長 |
+| 無線電指令 | `Copy`, `Negative`, `Affirm` | 翻譯：收到、唔得、明白 |
+| 機構名 | `ATF`, `DEA` | 翻譯：菸酒槍砲管理局、緝毒局 |
+| 醫療術語 | `TBI`, `PTS`, `CTE` | 翻譯：創傷性腦損傷、創傷後壓力、慢性創傷性脑病 |
+| SEAL 口頭禪 | `easy day`, `Easy fucking day` | 翻譯：小意思 |
+| 通用軍語 | `RPG`, `Fire in the hole` | RPG 保留，Fire in the hole 翻譯（要爆喇） |
+
+**教訓：** 唔好假設用戶要保留軍語。先問用戶偏好，再分類執行。
+
+#### 精準 fix 工作流（直接修改原有 zh-hk.srt）
+
+當殘留好少（~100 段 / 10 集），唔值得行完整 parse→batch→export pipeline：
+
+```
+1. pysubs2.load(zh-hk.srt) 直接讀取
+2. 檢查每段 plaintext：
+   a. 有 CJK → skip
+   b. Speaker label (Jason) → skip
+   c. 歌曲/音樂 → skip
+   d. 純英文 → 分類（角色名/軍語/真對白）
+3. 向用戶確認分類偏好
+4. subs[idx].text = 譯文
+5. subs.save() 直接覆蓋
+```
+
+**好處：**
+- 唔使 parse/export，直接改原有檔案
+- 保留原有格式、時間碼、index 完全一致
+- 適用於少量 fix（<200 段）
+
+#### CJK 檢測嘅 encoding 注意
+
+PowerShell 行 python 有以下常見陷阱：
+
+**問題 1：cp950 編碼食唔到 CJK 字符**
+```powershell
+# ❌ 會炒 UnicodeEncodeError
+python -c "print('中文')"
+
+# ✅ 解決：強制 UTF-8
+$env:PYTHONIOENCODING='utf-8'; python script.py
+```
+
+**問題 2：`python -c` 唔可以跨行**
+```powershell
+# ❌ PowerShell 會將 newline 當做 command terminator
+python -c "
+import json
+print('hello')
+"
+
+# ✅ 解決：用 .py 檔案代替
+python script.py
+```
+
+**問題 3：嵌套引號（nested quotes）**
+```powershell
+# ❌ 雙引號入面嘅雙引號會炒
+python -c "print(f'{len(items)} items')"
+
+# ✅ 解決：用 .py 檔案代替，或用 single quotes 包 outer string
+```
+
+**問題 4：PowerShell variable 同 f-string 撞名**
+```powershell
+# ❌ PowerShell 誤解 {done} 做 variable expansion
+python -c "print(f'{done} segments')"
+
+# ✅ 解決：用 .py 檔案代替
+```
+
+**Rule of thumb：** 任何超過 2 行嘅 Python code，或者含有 `{}`、`""` 等特殊字符嘅 code，一律用 `.py` 檔案執行，唔好用 `-c` inline。
+
+#### Copy 呢類詞喺 mixed content 嘅處理
+
+「Copy」呢個字可能出現喺中英夾雜嘅 segment：
+```
+Copy 收到。Sonny？  →  收到 收到。Sonny？（重複，但 radio protocol 合理）
+Copy，1。           →  收到，1。
+```
+
+唔好用 `any(ord(c) > 127)` 判斷「純英文」，因中文全形標點（`，`、`。`）都 > 127。用 regex `\bCopy\b` 直接 replace。
+
+---
+
 ## 與 ainiee-translate 的關鍵差異
 
 | 維度 | ainiee-translate | subtitle-translate |
@@ -611,6 +815,88 @@ python convert.py --input ep01.srt --output ep01.ass
 | 時間完整性 | 無 | **時間碼從不修改，只換文字** |
 
 ---
+
+## ⚠️ 實戰教訓：雙語 ASS 偵測陷阱（v1.3 — BanG Dream! 教訓）
+
+### 問題：檔名無中文標記，但檔案內有中文字幕
+
+2026年7月掃描 244 部動畫的中文字幕覆蓋率時，BanG Dream! 的 .ass 檔名完全沒有 `chi/zh/chinese` 等標記，subbridge `detect.py` 也回報 `Language: ja`，**但實際上檔案內含完整的中文字幕**。
+
+這些是 **PopSub 風格的雙語 ASS**，同一個 .ass 檔案裡用不同 Style 分別存放日文和中文字幕：
+
+```
+Style: InsJP, ...    ← Japanese dialogue
+Style: InsCN, ...    ← Chinese translation  (CN = Chinese)
+Style: OPJP,  ...    ← Japanese OP lyrics
+Style: OPCN,  ...    ← Chinese OP translation
+Style: EDJP,  ...    ← Japanese ED lyrics
+Style: EDCN,  ...    ← Chinese ED translation
+```
+
+字型編碼也透露中文軌道：
+```
+Fontname: 微软雅黑_GBK_     ← GBK encoding = Chinese
+Fontname: 方正准圆_GB18030  ← GB18030 encoding = Chinese
+```
+
+### 根因
+
+`detect.py` 的 `guess_language()` 只回報**主導語言**（日文漢字+假名 → `ja`），完全忽略了同文件中的中文字幕 Style 軌道。檔名也無 `chi/zh` 特徵。
+
+### 解決方案
+
+新增 `detect.py --deep` 模式，對 ASS 檔案進行深層掃描：
+
+```bash
+# 基本檢測（只回報主導語言）
+<PFX> -m detect --input BanG_Dream!.ass
+# → Language: ja  ← ❌ 遺漏中文
+
+# 深層檢測（發現雙語軌道）
+<PFX> -m detect --deep --input BanG_Dream!.ass
+# → Languages: ja+zh  ← ✅ 正確
+
+# 掃描整個目錄（遞迴）
+<PFX> -m detect --deep --scan --input /path/to/anime/
+# → [ja+zh] BanG Dream!/Season 1/EP01.ass
+# → [en]    Little Witch Academia/EP01.en.srt
+# → [ja]    Gurren Lagann/EP01.ass
+```
+
+### 雙語 ASS 偵測邏輯
+
+新增的 `--deep` 模式檢查三項指標：
+
+| 指標 | 檢查內容 | 範例 |
+|------|---------|------|
+| CN Style 名稱 | `Style: XXXXCN` 或 `Style: XXXXcn` | `InsCN`、`OPCN`、`EDCN` |
+| 中文字型編碼 | Fontname 含 GBK/GB18030/GB2312 | `微软雅黑_GBK_` |
+| Dialogue 中文 | 對話行含 CJK 漢字 | `Dialogue: 0,...` 內有中文字 |
+
+任一指標命中即標記為含中文。
+
+### 掃描統計模式
+
+```bash
+# 全面掃描 + 深層檢測
+<PFX> -m detect --deep --scan --input Z:/Videos/Anime
+
+# 輸出範例：
+#   [ja+zh] BanG Dream!/Season 1/EP01.ass
+#   [en]    Little Witch Academia/EP01.en.srt
+#   [ja]    After the Rain/EP01.ass
+#
+#   Total subtitle files: 1445
+#   With Chinese:         1438
+#   Without Chinese:      7
+```
+
+### 教訓
+
+- **永遠不要只靠檔名判斷語言**：很多 ASS 雙語檔案檔名只有英文/日文，中文藏在 Style 定義中
+- `guess_language()` 的 script-based 檢測對 CJK 混合文字只回報一種語言
+- 大規模掃描必須用 `--deep` mode 才能正確識別雙語字幕
+- 未來 ASS parser 需要考慮分 Style 軌道獨立檢測語言
 
 ## 實戰經驗（v1.0 實測教訓）
 
@@ -941,6 +1227,405 @@ print(f'{done}/{len(segs)} ({done*100//len(segs)}%)')
 "
 ```
 
+---
+
+## 實戰教訓（v1.3 — Servant of the People / Shōgun / Dekalog 30k 批量）
+
+### 數據回顧
+
+| 指標 | 值 |
+|------|-----|
+| 處理劇集 | 3 套 |
+| 處理集數 | 63 集 |
+| 總 segments | 30,319 |
+| 總翻譯 segments | 30,319（100%） |
+| 使用 subagent 次數 | ~25 次 |
+| 場景 | 烏克蘭政治諷刺劇 / 日本歷史時代劇 / 波蘭哲學劇情片 |
+
+### 1. 三套劇三種 tone — prompt 策略大不同
+
+同一條 pipeline（en → zh-hk），但每套劇嘅 prompt 完全唔同：
+
+| 劇集 | Tone | 角色名處理 | 特殊要求 |
+|------|------|-----------|---------|
+| **Servant of the People** | 搞笑/satirical | Vasyl, Yulia, Serhiy... | 保留烏克蘭地名 |
+| **Shōgun** | Formal/歷史 | Blackthorne, Toranaga, Mariko... | 保留日文階級稱呼（shōgun, daimyō, seppuku） |
+| **Dekalog** | 哲學/嚴肅 | 大多 unnamed（「個男人」「個女人」） | 波蘭名保留 Romanization |
+
+**教訓：** `--context` 唔夠用一個字（`military`/`medical`/`casual`）嚟表達 tone。要用完整句子描述 genre 同語氣，例如「烏克蘭政治 satire，搞笑輕鬆 tone」vs「日本戰國時代 history drama，formal 語氣」。
+
+### 2. Pipeline 進化：manifest → parallel dispatch → apply → export
+
+30k 規模下，原本 subbridge 嘅**逐集 batch read/write** 太慢。改用呢個 pipeline：
+
+```
+1. Parse all .srt → 獨立 cache.json（每集一個）
+2. Collect all untranslated segments → 單一 manifest.json
+3. Split manifest → N 個 batch（~1,200 segs each）
+4. Dispatch N 個 sub-agents in parallel
+5. Apply translations back → 各 cache.json
+6. Export all cache files → .zh-hk.srt
+```
+
+**好處：**
+- 唔使逐集 dispatch agent（63 集要 63 次 call）
+- 4-6 個 agent parallel，throughput 快好多
+- 1,200 segs/batch 係 sweet spot：細過 1,000 overhead 太大，大過 1,500 質素開始跌
+
+**適用場景：** 10+ 集嘅批量翻譯，建議用呢個 pipeline 代替逐集 batch read/write。
+
+### 3. Embedded SRT extract 係必要前置步驟
+
+Shōgun 嘅英文字幕 embedded in MKV，要先 extract 先解析到：
+
+```bash
+ffmpeg -i episode.mkv -map 0:N -c:s copy episode.srt
+```
+
+`-map 0:N` 嘅 N 係 subtitle stream index（通常 `0:2` 或 `0:1`，用 `ffprobe` check）：
+
+```bash
+ffprobe -v quiet -print_format json -show_streams episode.mkv \
+  | python -c "import sys,json; streams=json.load(sys.stdin)['streams']; [print(f'  index={s[\"index\"]}, codec={s[\"codec_name\"]}, lang={s.get(\"tags\",{}).get(\"language\",\"?\")}') for s in streams if s['codec_type']=='subtitle']"
+```
+
+Extract 完後就係正常 `.srt`，行得返標準 parse → translate → export 流程。
+
+### 4. Character name consistency 靠 prompt 唔靠 post-fix
+
+SEAL Team S07 嘅教訓係要用 post-fix script 將中文名（桑尼→Sonny、雷→Ray）replace 返做英文。但 new shows 嘅 source 本身就係英文名，所以做法唔同：
+
+- 直接喺 prompt 列晒全部角色名（全名 + 常見稱呼）
+- Agent 翻譯時自然保留英文名
+- 唔使 post-fix script
+
+**建議：** 如果 source 係英文，喺 prompt 用一個 section 列角色名就夠。如果 source 係中文/日文 translate 做英文先，先用 glossary 做 pre-processing。
+
+### 5. `_preserved` fallback — export 時要防炒
+
+Export 時，如果 `_preserved.raw_timing` 或 `_preserved.raw_index` 唔見咗（例如直接手寫 cache.json，冇經 parse），export 會炒。要用 fallback：
+
+```python
+raw = seg.get("_preserved", {})
+index = raw.get("raw_index", str(seg["text_index"]))
+timing = raw.get("raw_timing", f"{ms_to_timecode(seg['start_ms'])} --> {ms_to_timecode(seg['end_ms'])}")
+```
+
+### 6. 輸出檔名慣例 — 直接取代原有 .srt
+
+呢次 batch 嘅 .zh-hk.srt 輸出直接放喺 Season 1/ 目錄，同原始 .mkv 並列：
+
+```
+Season 1/
+  Show - S01E01 - Title.mkv
+  Show - S01E01 - Title.zh-hk.srt     ← 新
+  Show - S01E01 - Title.en.srt        ← 原本英文
+```
+
+Plex/VLC 會自動 detect `zh-hk.srt` 做繁體中文粵語字幕，唔使改名。
+
+---
+
+## 實戰總結（v1.5 — 多源知識整合）
+
+### 1. 跨劇種翻譯策略對照表
+
+| 維度 | SEAL Team S07 | SIX S01 | SIX S02 | Shinjuku Field Hospital | Servant of the People | Shōgun | Dekalog |
+|------|---------------|---------|---------|------------------------|----------------------|--------|---------|
+| Source language | en | en（已譯字幕） | en（新譯） | **ja**（混 en） | en | en | en（波蘭背景） |
+| 任務類型 | 修復殘留 | 修復 + 清廣告 | 全譯（MKV extract） | 補譯日文殘留 | 全譯 | 全譯 | 全譯 |
+| Context | 軍事 | 軍事 | 軍事 | 醫療/喜劇 | 政治諷刺 | 歷史時代劇 | 哲學劇情片 |
+| Tone | 嚴肅/專業 | 嚴肅/專業 | 嚴肅/專業 | 搞笑/溫馨 | 諷刺/幽默 | 正式/古典 | 嚴肅/沉思 |
+| 角色名處理 | 保留英文 | 保留英文 | 保留英文 | 日文名保留 | 烏克蘭名保留 | 日文名保留 | 波蘭名保留 |
+| 特殊處理 | 軍語分類翻譯 | 水印清除 + OCR清理 | 內嵌字幕萃取 | 日文Cantonese + 文化詞 | 政治 satire tone | 日文階級稱謂 | 哲學語氣 |
+| 規模 | 54 segments fix | ~100 segments fix | 3,222 segments 新譯 | 232 segments 補譯 | ~10,000 batch | ~10,000 batch | ~10,000 batch |
+
+### 2. 字幕格式規範要求
+
+字幕格式選擇會影響最終成品嘅兼容性同可讀性，綜合各方標準：
+
+| 規範項目 | GY/T 359-2022（國家標準） | VCB-S（壓制組） | 民間字幕組做法 | subbridge 預設 | 建議 flag |
+|----------|--------------------------|----------------|--------------|--------------|----------|
+| 編碼 | UTF-8 | **UTF-8 with BOM** | UTF-8 | UTF-8 | `--encoding utf-8-bom` |
+| 換行 | - | **CRLF** | LF | LF | `--crlf` |
+| 句號 | 使用 | - | **省略**（美觀） | 保留 | `--no-period` |
+| 行長（中文） | - | - | 10-15字極限 | 無硬性限制 | verify quality |
+| 行長（英文） | ≤ 50 chars | - | - | 無硬性限制 | `--max-chars 50` |
+| 字體顏色 | 白色 90-100% 亮度 | 任意（需附字體包） | 白色/低飽和黃 | - | export guideline |
+| 字幕底色 | 不宜彩色背景 | 描邊/陰影/半透明 | 描邊/陰影 | - | styling note |
+| 標點符號 | 按語言習慣 | - | 省略句號、少用標點 | 全形標點 | `--compact-punct` |
+| 4K HDR 亮度 | ≤ 300cd/m² | - | - | - | verify note |
+
+**實戰建議：**
+- **SRT 輸出**：用 plain UTF-8（無 BOM），LF 換行，相容性最好
+- **ASS 輸出**：可用 UTF-8 with BOM + CRLF（VCB-S 標準），支援 styling
+- **標點策略**：對白字幕省略句號（`--no-period`），說明性字幕保留
+- 行長限制應由 `verify quality --market asia` 控制（10cps），而非硬性截斷
+
+### 3. 翻譯通則 Checklist
+
+基於 GY/T 359-2022、學術文獻同民間經驗，適用於所有 subbridge 翻譯任務：
+
+#### 3.1 精簡原則（Priority 1）
+- [ ] 中文字幕每行 ≤ 15 字為極限，10 字以內更佳
+- [ ] 刪除口語中重複、停頓、無意義嘅 filler words
+- [ ] 感嘆詞通常直接省略（Oh, Well, Um → 刪除）
+- [ ] 一句中文能表達嘅嘢，唔好拆做兩句
+
+#### 3.2 語序配合（Priority 2）
+- [ ] 字幕語序盡量跟原文，避免前後調換
+- [ ] 理由：觀眾聽緊原文 + 睇緊字幕，語序同步減少認知負擔
+- [ ] 條件句/時間從句如果調換會令觀眾 confused，就保留原文順序
+
+#### 3.3 角色語氣配合
+- [ ] 角色身份、個性、情緒應反映喺用詞
+- [ ] 正式場合用書面語，casual 場合用口語
+- [ ] 軍事劇：簡潔、指令式（「殿後。」唔係「我哋應該殿後。」）
+- [ ] 醫療劇：專業術語準確
+- [ ] 喜劇：保留幽默 timing，唔好譯得太「書面」
+
+#### 3.4 粗話/禁忌處理
+- [ ] 電視級別：溫和化處理（fucking → 刪除 or「該死」）
+- [ ] 限制級：可保留強度，但避免直接用「屌」等字（用「靠」「該死」代替）
+- [ ] 書面粗俗比口語更刺眼，宜 downgrade 一級
+
+#### 3.5 文化增譯
+- [ ] 文化典故/歷史事件：譯出意義而非直譯
+- [ ] e.g. `Louisiana Purchase` →「美國向法國買地」，唔係「路易斯安納購地案」
+- [ ] e.g. `quinceañera` →「15 歲成年派對」，保留原文詞 + 意譯
+- [ ] 唔好加注釋（民間字幕組做法），用字面就解釋到
+
+#### 3.6 稱謂本地化
+- [ ] 社交稱謂按目標語言習慣：`Mr.` →「先生」，`Sir` →「長官」
+- [ ] 親屬稱謂：`Uncle` →「叔叔」/「阿叔」，唔好直譯
+- [ ] 日劇稱謂：`先生` →「醫生」/「老師」按 context
+
+#### 3.7 計量單位
+- [ ] 宜換算為目標語言常用單位
+- [ ] 非必要可保留原文 + 換算（`100 miles → 100 英里（約 160 公里）`）
+- [ ] 字幕空間有限時，直接用換算值
+
+#### 3.8 字幕 vs 說明性字幕區分
+- [ ] 對白字幕：白字、置中、下方
+- [ ] 說明性字幕（時間/地名/人物介紹）：可用括號或不同顏色區分
+- [ ] 歌詞字幕：用 ♪ 標記或斜體
+- [ ] 手機訊息/信件/社交媒體：用《》或「」標註
+
+### 3.9 粵語 vs 國語（zh-hk vs zh-tw/cn）取捨
+
+subbridge 預設 zh-hk = 香港粵語口語，但實際翻譯時需要因應節目類型做取捨：
+
+| 維度 | 粵語口語（zh-hk） | 國語書面語（zh-tw/cn） |
+|------|----------------|---------------------|
+| 適用場景 | 日常對話、喜劇、真人騷 | 紀錄片、新聞、歷史正劇 |
+| 軍事劇 | 指令簡潔有力（「殿後」「收到」） | 可通用，語氣較正式 |
+| 日劇/韓劇 | 更貼地，角色親切感強 | 較多觀眾聽得明 |
+| 文化詞 | `hotel`→「酒店」，`friend`→「朋友」 | `hotel`→「飯店」，`friend`→「朋友」 |
+| 語氣詞 | `啦`、`嘛`、`嘅`、`嘅` | `了`、`嗎`、`的` |
+| 句末助詞 | `㗎`、`啫`、`咋` | 少用句末助詞 |
+| 粗話 | `仆街`、`屌` | `靠`、`該死` |
+
+**實戰原則：**
+- 如果 source 係英文：zh-hk 粵語口語係預設（香港觀眾期望）
+- 如果 source 係日文：**建議用書面語為主**（日劇嘅正式場合、醫療場景更適合書面語），日常對話可用粵語口語
+- 如果 source 係韓劇：大多用國語（台灣市場主導）
+- **關鍵**：同一個節目入面保持一致 tone，唔好口語書面語 mixed
+
+#### Shinjuku Field Hospital 實戰 — 日劇粵語取捨案例
+
+新宿野戦病院（Shinjuku Field Hospital）嘅特殊處理：
+
+| 原文（日文） | 粵語口語譯法 | 書面語譯法 | 最終選擇 |
+|------------|------------|-----------|---------|
+| `むなしくないんです` | 唔會覺得空虛㗎 | 我不會感到空虛 | 口語 |
+| `どうする？` | 點算？ | 怎麼辦？ | 口語 |
+| `おやすみ` | 早唞 | 晚安 | 口語 |
+| `ガムテで？` | 用膠紙黐？ | 用膠帶黏？ | 混合（ガムテ保留） |
+| `バイタルは？` | 生命體徵呢？ | 生命體徵呢？ | 書面語（醫療用語） |
+| `ダメージコントロール` | damage control | 損害控制 | 醫療 term，保留英文 |
+| `ホチキス` | Hotchkiss（釘書機） | 釘書機 | 文化詞，意譯 |
+| `ネットカフェ` | 網吧 | 網咖 | 口語 |
+| `シャンパンタワー` | 香檳塔 | 香檳塔 | 通用 |
+
+**教訓：** 日劇翻譯要 mixed strategy — 醫療用語用書面語確保 accuracy，日常對話用粵語保持親切感，文化特定詞用意譯。唔好一刀切全部口語或全部書面語。
+
+### 4. 水印/OCR/廣告清理 Pattern Library
+
+從 SIX S01 實戰提煉，適用於 `.zh-hk.srt` 修復任務：
+
+#### 4.1 字幕水印廣告
+```
+"Watch any video online with Open-SUBTITLES\nFree Browser extension: osdb.link/ext"
+"- Synced and corrected by VitoSilans -\n-- www.Addic7ed.com --"
+"Please rate this subtitle at www.osdb.link/xxxxx"
+"Advertise your product or brand here\ncontact www.OpenSubtitles.org today"
+"Do you want subtitles for any video?\n-=[ ai.OpenSubtitles.com ]=-"
+"api.OpenSubtitles.org is deprecated, please\nimplement REST API from OpenSubtitles.com"
+```
+
+**清理策略：** 用 `startswith()` 比 exact match 更穩陣（因 URL hash 每集唔同）：
+```python
+if t.startswith("Please rate this subtitle at www.osdb.link"):
+    subs[idx].text = ""
+```
+
+#### 4.2 OCR 殘留 Pattern
+```
+O0 c1      →  數字「0」同字母「O」混淆（OCR error）
+〖00 c1〗   →  日文字幕 OCR 殘留
+_          →  底線 placeholder
+*          →  星號 placeholder
+```
+
+**清理策略：** 單字符 `_`、`*` 可直接移除；`O0 c1` 用 exact match。
+
+#### 4.3 Aegisub 垃圾字段清理
+
+ASS/SRT 檔案經 aegisub 編輯後，會殘留製作軟件嘅 metadata 字段，應刪除：
+```
+[Aegisub Project Garbage]     →  刪除整個 section
+[Aegisub Extradata]           →  刪除整個 section
+```
+
+**清理策略：** 用 regex 匹配 section header 到下一 section 之間嘅內容：
+```python
+import re
+text = re.sub(r'\[Aegisub Project Garbage\].*?(\n\[|$)', r'\1', text, flags=re.DOTALL)
+text = re.sub(r'\[Aegisub Extradata\].*?(\n\[|$)', r'\1', text, flags=re.DOTALL)
+```
+
+VCB-S 規範要求所有發佈用字幕必須刪除呢兩個字段。
+
+#### 4.4 音樂節目水印
+```
+♬～ 反覆出現 → 歌曲標記，保留
+```
+
+### 5. 音頻轉字幕（ASR）整合策略
+
+當影片完全冇字幕時（如 Shinjuku E06），可用 ASR 生成字幕再翻譯。
+
+subbridge 支援兩種 ASR backend，可按硬件選擇：
+
+| Backend | 硬件需求 | 模型建議 | 速度 | 特點 |
+|---------|---------|---------|------|------|
+| **faster-whisper**（預設） | CPU / AMD GPU / NVIDIA GPU | `tiny` 或 `base` | CPU 上 1-4x realtime | 輕量、免 CUDA、VAD 過濾 |
+| **WhisperX** | NVIDIA GPU only（≥8GB VRAM） | `large-v2` | GPU 上 70x realtime | 精準對齊 + 說話人標記 |
+
+#### 5.1 輕量方案：faster-whisper（CPU / AMD GPU）
+
+```bash
+pip install faster-whisper
+
+# CPU 上最快（tiny model，~2x realtime）
+<PFX> -m extract asr --input episode.mkv --backend faster-whisper --model tiny
+
+# CPU 上平衡（base model，~1x realtime，準確度較好）
+<PFX> -m extract asr --input episode.mkv --backend faster-whisper --model base
+
+# 指定語言（加速 + 提高準確度）
+<PFX> -m extract asr --input episode.mkv --backend faster-whisper --model tiny --language ja
+```
+
+#### 5.2 精準方案：WhisperX（NVIDIA GPU）
+
+```bash
+pip install whisperx
+# Requires: CUDA 12.8 + NVIDIA GPU (≥8GB VRAM)
+
+# GPU 全速（large-v2，70x realtime）
+<PFX> -m extract asr --input episode.mkv --backend whisperx --model large-v2 --device cuda
+
+# 說話人標記（需 HuggingFace token）
+<PFX> -m extract asr --input episode.mkv --backend whisperx --diarize --hf_token YOUR_TOKEN
+```
+
+#### 5.3 流程對比
+
+```
+faster-whisper: audio → CTranslate2 inference → VAD filter → sentence segments → SRT
+                          (CPU: int8, 1-4x realtime, ~1GB RAM)
+
+WhisperX:      audio → Whisper ASR (batched) → wav2vec2 alignment → pyannote diarization → SRT
+                          (GPU: float16, 70x realtime, ~8GB VRAM)
+```
+
+#### 5.4 輸出同接續翻譯
+
+```bash
+# ASR 一鍵完成，輸出 {影片名}.asr.srt
+<PFX> -m extract asr --input episode.mkv --output-dir work/
+
+# 輸出 JSON 包含 path/segments/language，可用 pipe 接入翻譯流程
+<PFX> -m parse --input work/episode.asr.srt --source-lang en --target-lang zh --region hk --out work/cache.json
+# → 繼續正常翻譯流程（auto → batch read → subagent → write → export）
+```
+
+#### 5.5 實戰建議
+
+| 場景 | 推薦 backend | 模型 | 理由 |
+|------|-------------|------|------|
+| CPU only、快 | faster-whisper | tiny | 2x realtime，~1GB RAM |
+| 日常生活片 | faster-whisper | base | 1x realtime，準確度夠用 |
+| 軍事/醫療劇（術語多） | WhisperX | large-v2 | 準確度高，有 alignment |
+| 需 speaker 標記 | WhisperX | large-v2 | pyannote diarization |
+| 日文/非英語 | faster-whisper | base/small | WhisperX 日文支援有限 |
+| AMD GPU | faster-whisper | tiny/base | 支援 OpenVINO |
+
+#### 5.6 限制
+- 重疊說話處理不佳（兩個 backend 都 weak）
+- 非英語語言準確度明顯低過英文
+- 數字/符號無法對齊（"2014."、"£13.60"）
+- WhisperX 需 NVIDIA GPU + CUDA 12.8
+
+### 6. 工具生態參考
+
+subbridge 以外嘅開源字幕工具：
+
+| 工具 | 語言 | 主要功能 | 可補 subbridge 邊部分 |
+|------|------|---------|---------------------|
+| **subedit**（helixarch） | BASH | time shift/adjust/sync, clean trash, OCR fix | `verify quality` 參考其 time validation（max 7s, 0.06-0.15s/char） |
+| **WhisperX**（m-bain） | Python | ASR + word timestamps + diarization | `extract asr` 模組 |
+| **aegisub** | C++/Lua | 可視化字幕編輯器 | 打軸/時間微調（外部位） |
+| **ListAssFonts** | Windows | ASS 字體分析 + 錯誤檢測 | 字體包檢查（ASS 輸出前） |
+| **FontLoaderSub** | Windows | 臨時掛載字體測試 | 字體包驗證 |
+
+**subedit 有用 feature：**
+```bash
+# Clean trash（多空格、引號正規化、句首大寫）
+subedit -i input.srt -c
+
+# OCR fix（0/O 混淆、l/I 混淆）
+subedit -i input.srt -m
+
+# 刪除聽障字幕
+subedit -i input.srt -k '([{'
+```
+
+### 7. 今次 Session 實戰匯總
+
+| 項目 | 處理內容 | 規模 | 結果 |
+|------|---------|------|------|
+| SEAL Team S07 | 補譯音效 + 對白 + 軍語 | 54 segments | 95.6% CJK |
+| SIX S01 E01-E08 | 清理水印/OCR + 補譯 | ~100 segments | 96% CJK |
+| SIX S02 E05-E10 | 全譯（MKV extract → translate → export） | 3,222 segments | 91-99% CJK |
+| Shinjuku Field Hospital | 補譯 232 段日文殘留 | 232 segments | 96-99% CJK |
+| **總計** | **4 套劇，31 集** | **~3,608 segments** | - |
+
+**新增/完善嘅工作流模式：**
+- **修復模式**：直接 pysubs2 load → match → replace → save（適合 <200 段 fix）
+- **全譯 pipeline**：parse → auto → batch → subagent → write → export（適合 >500 段）
+- **ASR pipeline**：ffmpeg → WhisperX → SRT → translate（適合冇字幕 video）
+- **日語處理**：source language 唔好靠檔名，要用 content detection
+
+**關鍵數字：**
+- 中文字幕行長 sweet spot: 10-15 chars
+- CPS 標準: 10（亞洲）/ 12（歐美）
+- batch size sweet spot: 1,200 segs per subagent
+- 修復 mode 適用 threshold: <200 segments
+- 全譯 mode 適用 threshold: >500 segments
+
+---
 
 **Q: 翻譯後時間碼變了？**
 A: 不應該。時間碼存在 `_preserved.raw_timing`，匯出時原樣寫回。若變了請回報 bug。

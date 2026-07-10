@@ -1,6 +1,9 @@
-"""Language and encoding detection for subtitle files."""
+"""Language and encoding detection for subtitle files.
+Deep/bilingual detection for ASS files with dual JP+CN styles."""
 
 import argparse
+import os
+import re
 import sys
 
 
@@ -48,6 +51,11 @@ _SCRIPT_PATTERNS = {
     "ru": lambda t: bool(any("\u0400" <= c <= "\u04FF" for c in t)),
 }
 
+_CN_STYLE_RE = re.compile(r'Style:\s*\w*[Cc][Nn]\d*,')
+_CN_FONT_RE = re.compile(r'GBK|GB18030|GB2312')
+_CN_CHAR_RE = re.compile(r'[\u4e00-\u9fff\u3000-\u303f]')
+_DIALOGUE_RE = re.compile(r'^Dialogue:')
+
 
 def guess_language(text: str) -> str:
     for lang, checker in _SCRIPT_PATTERNS.items():
@@ -69,13 +77,132 @@ def guess_language(text: str) -> str:
     return "en"
 
 
+def detect_languages_deep(path: str) -> list:
+    """Deep-detect all languages present in a subtitle file.
+    For ASS files, checks for bilingual style tracks (e.g., InsCN, OPCN).
+    Returns a list of language codes.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    enc = detect_file_encoding(path)
+    langs = []
+
+    try:
+        with open(path, "r", encoding=enc, errors="replace") as f:
+            content = f.read()
+    except Exception:
+        return ["unknown"]
+
+    dom_lang = guess_language(content)
+    langs.append(dom_lang)
+
+    if ext in (".ass", ".ssa"):
+        cn_styles_found = False
+        cn_dialogue_found = False
+
+        for line in content.splitlines():
+            if _CN_STYLE_RE.search(line):
+                cn_styles_found = True
+            if _CN_FONT_RE.search(line):
+                cn_styles_found = True
+            if _DIALOGUE_RE.match(line) and _CN_CHAR_RE.search(line):
+                cn_dialogue_found = True
+
+        if cn_styles_found or cn_dialogue_found:
+            if dom_lang != "zh":
+                langs.append("zh")
+
+    return list(dict.fromkeys(langs))  # dedup, preserve order
+
+
+def scan_directory(path: str, deep: bool = False) -> list:
+    """Recursively scan directory for subtitle files and detect languages.
+    Returns list of dicts with file info.
+    """
+    EXT_SUBS = {".ass", ".srt", ".ssa", ".sub", ".idx", ".vtt"}
+    results = []
+
+    for dirpath, dirnames, filenames in os.walk(path):
+        for f in sorted(filenames):
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in EXT_SUBS:
+                continue
+            full = os.path.join(dirpath, f)
+
+            if deep:
+                langs = detect_languages_deep(full)
+            else:
+                enc = detect_file_encoding(full)
+                try:
+                    with open(full, "r", encoding=enc, errors="replace") as fh:
+                        text = fh.read()
+                except Exception:
+                    langs = ["unknown"]
+                else:
+                    langs = [guess_language(text)]
+
+            results.append({
+                "file": full,
+                "ext": ext,
+                "encoding": detect_file_encoding(full),
+                "languages": langs,
+                "size": os.path.getsize(full),
+            })
+
+    return results
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Detect language/encoding of subtitle file")
-    ap.add_argument("--input", "-i", required=True, help="Input file")
+    ap = argparse.ArgumentParser(
+        description="Detect language/encoding of subtitle file(s)"
+    )
+    ap.add_argument("--input", "-i", help="Input file or directory")
     ap.add_argument("--text", help="Text to analyze (instead of file)")
     ap.add_argument("--encoding", action="store_true", help="Detect encoding")
     ap.add_argument("--language", action="store_true", help="Detect language")
+    ap.add_argument("--deep", action="store_true",
+                    help="Deep bilingual detection: check ASS CN-style tracks")
+    ap.add_argument("--scan", action="store_true",
+                    help="Recursively scan directory for subtitle files")
     args = ap.parse_args(argv)
+
+    if args.scan and args.input:
+        if not os.path.isdir(args.input):
+            print(f"Error: --scan requires a directory, got: {args.input}", file=sys.stderr)
+            sys.exit(1)
+        results = scan_directory(args.input, deep=args.deep)
+        cn_total = 0
+        no_cn = []
+        for r in results:
+            has_cn = "zh" in r["languages"]
+            if has_cn:
+                cn_total += 1
+            langs_str = "+".join(r["languages"])
+            print(f"  [{langs_str:>8s}] {r['file']}")
+            if not has_cn:
+                rel = os.path.relpath(r["file"], args.input)
+                no_cn.append(rel)
+        print(f"\n  Total subtitle files: {len(results)}")
+        print(f"  With Chinese:         {cn_total}")
+        print(f"  Without Chinese:      {len(no_cn)}")
+        if no_cn:
+            print(f"\n  Files without Chinese ({len(no_cn)}):")
+            for f in no_cn[:20]:
+                print(f"    {f}")
+            if len(no_cn) > 20:
+                print(f"    ... and {len(no_cn)-20} more")
+        return
+
+    if args.deep and args.input:
+        if os.path.isdir(args.input):
+            results = scan_directory(args.input, deep=True)
+            for r in results:
+                langs_str = "+".join(r["languages"])
+                print(f"{langs_str:>8s}  {r['file']}")
+            return
+        else:
+            langs = detect_languages_deep(args.input)
+            print(f"Languages: {'+'.join(langs)}")
+            return
 
     if args.encoding and args.input:
         enc = detect_file_encoding(args.input)
@@ -85,6 +212,9 @@ def main(argv=None):
         if args.text:
             text = args.text
         elif args.input:
+            if os.path.isdir(args.input):
+                print("Error: --language with a directory requires --deep or --scan", file=sys.stderr)
+                sys.exit(1)
             enc = detect_file_encoding(args.input)
             with open(args.input, "r", encoding=enc) as f:
                 text = f.read()
@@ -93,8 +223,8 @@ def main(argv=None):
         lang = guess_language(text)
         print(f"Language: {lang}")
 
-    if not args.encoding and not args.language:
-        if args.input:
+    if not args.encoding and not args.language and not args.deep and not args.scan:
+        if args.input and not os.path.isdir(args.input):
             enc = detect_file_encoding(args.input)
             with open(args.input, "r", encoding=enc) as f:
                 text = f.read()
