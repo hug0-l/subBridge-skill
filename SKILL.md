@@ -1957,21 +1957,644 @@ subedit -i input.srt -k '([{'
 | SIX S01 E01-E08 | 清理水印/OCR + 補譯 | ~100 segments | 96% CJK |
 | SIX S02 E05-E10 | 全譯（MKV extract → translate → export） | 3,222 segments | 91-99% CJK |
 | Shinjuku Field Hospital | 補譯 232 段日文殘留 | 232 segments | 96-99% CJK |
-| **總計** | **4 套劇，31 集** | **~3,608 segments** | - |
+| SEAL Team S1 | 全譯 22 集 en→zh-hk | 17,930 segments | 95-99% CJK |
+| SEAL Team S2 | 全譯 22 集 en→zh-hk | 16,271 segments | 96-99% CJK |
+| SEAL Team S3 | 全譯 20 集 en→zh-hk | 17,451 segments | 92-99% CJK |
+| SEAL Team S4 | 全譯 16 集 en→zh-hk | 14,010 segments | 95-99% CJK |
+| SEAL Team S5 | 全譯 14 集 en→zh-hk | 11,754 segments | 94-99% CJK |
+| **總計** | **9 套劇，125 集** | **~86,816 segments** | **95.8% overall CJK** |
+
+### 8. 致命教訓：永遠 VERIFY 實際輸出，唔好信 CLAIM
+
+多次 subagent 回報「100% 完成」但實際檔案冇被更新。**必須強制驗證：**
+
+```python
+# 每次任務後：REAL verification（唔信 subagent 口頭報告）
+zh = pysubs2.load(out_path)
+en = pysubs2.load(en_path)
+assert len(zh) == len(en), f"SEGMENT COUNT: {len(zh)} vs {len(en)}"
+cjk = sum(1 for s in zh if re.search(r'[\u4e00-\u9fff]', s.plaintext))
+total = sum(1 for s in en if s.plaintext.strip())
+print(f"REAL CJK: {cjk}/{total} = {cjk*100//total}%")
+assert cjk/total > 0.90, f"COVERAGE TOO LOW: {cjk}/{total}"
+```
+
+**核心規則：**
+- subagent 話 done = 0。`pysubs2.load()` + CJK count = 唯一真相
+- 要用 `Remove-Item` + force overwrite 先保證檔案更新，subagent 經常 skip 現有檔案
+- 每集做完即時 verify，唔好累積到全部先 check
+- 每次 batch 之後都要 count segments + CJK%，否則 alignment 炒咗都唔知
+
+### 9. Alignment 係最大陷阱
+
+S6 全季翻譯因為 batch read/write 時 index 錯位，導致 Chinese text shift 咗 1 個 segment。
+每個 segment 嘅中文對唔返英文原文，成季報廢要重做。
+
+**預防方法：**
+- 永遠用 direct pysubs2：讀 EN SRT → translate each segment → 直接寫 ZH SRT
+- 唔好用 subbridge batch read/write pipeline（已知有 alignment bug）
+- 每次 save 後 verify：`len(zh) == len(en)` + 頭 3 個 timecode match
+- 如果由 cache.json export，check `_preserved.raw_index` 同 `text_index` 一致
+
+```python
+# 安全做法：direct SRT-to-SRT
+en = pysubs2.load(en_path)
+zh = pysubs2.SSAFile()
+for sub in en:
+    new = sub.copy()
+    new.text = translate(sub.plaintext)  # translate each segment
+    zh.append(new)
+zh.save(out_path)
+# Verify immediately
+assert len(pysubs2.load(out_path)) == len(en)
+```
+
+### 10. DeepL 係最佳引擎但有限額
+
+| 引擎 | 質素 | 速度 | 限制 |
+|------|------|------|------|
+| **DeepL API** | ✅ 最好，自然繁中 | 快（batch） | Free tier 500K chars/month |
+| Agent (LLM) | ✅ 如果逐句譯 | 慢（~800 segs/min） | 冇 quota 但 temptation 用 dictionary |
+| Google Translate | ❌ IP ban | 快 | 唔穩定，ban IP |
+| auto_translate | ⚠️ 只 cover 10-15% | 快 | 音效短語 only |
+
+**DeepL 用量實戰：**
+- SEAL Team 114 集 ≈ 950K chars（超咗 free tier）
+- 每次 call 前 check quota，用完要 fallback 去 agent translation
+- Post-processing 必須：DeepL 出繁體中文，要轉 嘅/佢/喺/哋/唔
+
+### 11. Domain Knowledge 唔可以靠 MT
+
+YPJ（Kurdish Women's Protection Units）被錯誤譯做「PJ（傘兵醫護）」→「軍醫」。
+呢類 domain-specific term 一定要 glossary pre-protect。
+
+**解決方案：**
+```python
+# 翻譯前 protect domain terms
+PROTECTED = ['YPJ', 'YPG', 'IED', 'RPG', 'TBI', 'PTS', 'CTE']
+for term in PROTECTED:
+    text = text.replace(term, f'__{term}__')  # 暫存
+text = translate(text)
+for term in PROTECTED:
+    text = text.replace(f'__{term}__', term)  # restore
+```
+
+### 12. 實戰規則 CheckList
+
+- [ ] 永遠用 `.py` file 唔好用 `python -c` inline（PowerShell nested quotes 必炒）
+- [ ] 唔信 subagent 口頭報告，只用 `pysubs2.load()` 驗證
+- [ ] Remove-Item 舊檔案先，subagent 唔會 overwrite
+- [ ] 每集做完 check len(zh)==len(en) + CJK count
+- [ ] domain terms 要 pre-protect 先翻譯
+- [ ] DeepL 出嚟要 post-process zh-hk conversion
+- [ ] SRT 直接讀寫最安全，batch pipeline 易炒 alignment
 
 **新增/完善嘅工作流模式：**
 - **修復模式**：直接 pysubs2 load → match → replace → save（適合 <200 段 fix）
-- **全譯 pipeline**：parse → auto → batch → subagent → write → export（適合 >500 段）
-- **ASR pipeline**：ffmpeg → WhisperX → SRT → translate（適合冇字幕 video）
+- **全譯 pipeline**：direct SRT-to-SRT（唔建議用 batch read/write）
+- **ASR pipeline**：ffmpeg → WhisperX → SRT → translate
 - **日語處理**：source language 唔好靠檔名，要用 content detection
 
 **關鍵數字：**
 - 中文字幕行長 sweet spot: 10-15 chars
 - CPS 標準: 10（亞洲）/ 12（歐美）
-- batch size sweet spot: 1,200 segs per subagent
-- 修復 mode 適用 threshold: <200 segments
-- 全譯 mode 適用 threshold: >500 segments
+- DeepL free tier: 500K chars/month
+- SEAL Team 114 集 ≈ 950K chars
+- CJK coverage threshold: >90%（低過即係炒咗）
 
+### 13. 大量修復 Pipeline（32 集實戰經驗）
+
+當遇到大量機翻爛字幕要 fix，用呢個 pipeline（每集 ~800-900 segs）：
+
+**工具清單：**
+- `translate_bulk.py` — 從 bilingual 或純 EN SRT 抽 unique English texts + segment_map
+- `apply_translations.py` — 將 `idx_NNN` → 粵語 JSON 寫返入 SRT，自動 filter credit 段
+- `verify.py` — CJK 覆蓋率 + alignment 檢查
+
+**Step 1: 抽 unique texts**
+```bash
+python translate_bulk.py "input.en.srt" "output_unique.json"
+```
+Output 結構：`unique_texts[]`、`segment_map{idx_NNN: en_text}`、`unique_to_indices{text: [idx_NNN]}`
+
+**Step 2: Agent 批量翻譯（Mode C++）**
+```
+開一個 general subagent：
+  Read output_unique.json
+  將 ALL unique_texts 譯做自然粵語
+  寫 flat JSON {idx_NNN: 粵語} 去 translations.json
+```
+**Critical：Agent 一定要出 flat `{"idx_000": "...", ...}` JSON。常見炒車位：**
+- 巢咗喺 `{"translations": {...}}` 裡面 → 拆返出嚟就得
+- 用英文原文做 key 而非 idx_NNN → 要透過 unique_to_indices 重新 mapping
+- BOM 編碼 → 用 utf-8（唔好用 utf-8-sig）重新 save
+- Python repr string `{'idx_000': '...'}` 代替 JSON → 用 ast.literal_eval 救返
+
+**Step 3: Apply**
+```bash
+python apply_translations.py "input.en.srt" "translations.json" "output.zh-hk.srt"
+```
+
+**Step 4: Verify**
+```python
+zh = pysubs2.load("output.zh-hk.srt")
+en = pysubs2.load("input.en.srt")
+cjk = sum(1 for s in zh if re.search(r'[\u4e00-\u9fff]', s.plaintext))
+print(f'{cjk}/{len(en)} = {cjk*100/len(en):.1f}%')
+```
+
+**Performance 實戰數字：**
+- ~800 unique texts/集 → agent 1-2 分鐘譯完
+- 6 個 parallel agents → 6 集 ~3 分鐘搞掂
+- 32 集 total：約 4 小時 wall time（主要等 agent response）
+
+**常見陷阱：**
+- UTF-16 編碼 EN 檔 → `codecs.open(path, encoding='utf-16-le')` 或提前 convert
+- 冇 EN SRT 可用 → tvsubtitles.net 用 CookieJar 下載，或 subtitlecat.com 嵌入式提取
+- Unicode 控制字元（U+202D LRO）污染 extracted text → regex strip 咗先入 segment_map
+- 新舊 EN SRT segment count 唔 match → 一定要用同 MKV 對應嘅 source timing
+- Non-CJK 段多數係 `[音效]`、歌詞、英文名 — 如果對白全部譯晒，低過 90% 都可接受
+
+### 14. Pipeline 入面嘅角色職責
+
+| 角色 | 職責 | 用咩做 | 要唔要人睇住 |
+|------|------|--------|------------|
+| **Extractor** | 從 bilingual/EN SRT 抽 unique English texts，砌 segment_map | `translate_bulk.py` | 唔使，自動行 |
+| **Translator** | 將 unique English texts 譯做自然粵語 | General subagent（LLM） | 唔使，但 output format 成日炒，要 downstream fix |
+| **Formatter** | 食 agent output，normalize 做 flat `idx_NNN` JSON（fix nesting/BOM/Python repr） | `fix_translations.py` 或手動 script | 要！因為 agent 成日出古怪 format |
+| **Applier** | 將 translations JSON 寫返入 SRT，filter credit 段 | `apply_translations.py` | 唔使 |
+| **QC** | Check CJK% + alignment count | `verify.py` / python one-liner | 睇結果，<90% 要 redo |
+| **EN Scout** | 冇 EN SRT 時去網上搵 | tvsubtitles.net + CookieJar / subtitlecat.com extract | 要，因為網站結構成日變 |
+| **Encoding Fixer** | UTF-16/GBK 嘅 SRT convert 做 UTF-8 | `convert_encoding.py` | 唔使，但 detect 要準 |
+| **Orchestrator** | 管理 parallel agents，排邊集先做，等晒結果 | 手動 spawn 6-7 個 task | 要，決定 batch 點分 |
+| **Deployer** | 抄 .zh-hk.srt 去 Z drive， backup 舊檔 | `verify_and_copy.py` | 唔使 |
+
+**實戰中邊個最常出問題：**
+1. **Translator** — output format 唔穩定（nested JSON / BOM / Python repr），所以要 Formatter 補镬
+2. **EN Scout** — 網站反爬/改結構，要成日轉 strategy
+3. **Orchestrator** — 如果唔 parallel 做，32 集會做到天荒地老
+
+**可以省略嘅角色（如果條件滿足）：**
+- 如果 bilingual SRT 已經有完整 EN → 唔需要 EN Scout
+- 如果 EN file 係 UTF-8 → 唔需要 Encoding Fixer
+- 如果 agent output 次次都 flat JSON → 唔需要 Formatter（但現實係成日炒）
+
+### 15. 各角色嘅 Prompt Engineering 心得
+
+#### 15.1 Translator（最關鍵，成日炒）
+
+呢個角色用 general subagent，prompt 決定一切。以下係 32 集實戰試出來嘅要點：
+
+**Output format 要講明兩次：**
+```
+CRITICAL: The output JSON must be a FLAT dict with keys like idx_000, idx_001, etc.
+NOT nested under "translations". NOT with English text as keys.
+Example: {"idx_000": "上集提要...", "idx_001": "你講咩話？"}
+```
+— Head 講一次，body 再講一次，因為 agent 成日無視。
+
+**Rules 要正面列＋反面列：**
+```
+1. Natural Cantonese particles: 嘅, 佢, 喺, 哋, 唔, 咗, 嘢, 啲, 係 (NOT 是), 冇 (NOT 沒有)
+2. NO Mandarin grammar: avoid 把, 被, 掉, 這, 那, 什麼
+```
+— 正面話要用咩，反面話唔好用咩，兩邊夾實。
+
+**Domain 要俾 context：**
+```
+This is a military TV show (SEAL Team). US Navy SEALs.
+Military radio: "Copy"→"收到", "Roger"→"明白", "this is"→"呢度係", "out"→"收線"
+Character names stay English: Jason, Sonny, Clay, Trent, Ray...
+```
+— 唔俾 context 嘅話，agent 會當普通英文譯，軍事術語變晒書面語。
+
+**要佢 report 做咗咩：**
+```
+Report total idx_NNN entries written.
+```
+— 呃，其實 agent report 嘅數字唔信得過，但起碼逼佢數一次。
+
+#### 15.2 Formatter（救火專用）
+
+當 agent 出咗古怪 JSON，用 script fix 好過再用 LLM。但如果要用 LLM 救：
+
+```
+Fix this translations JSON. Expected format: {"idx_000": "translation", ...}
+Problems to fix:
+1. If nested under "translations" key, extract the inner dict
+2. If values are Python repr strings (single quotes), parse them
+3. If keys are English text instead of idx_NNN, you CANNOT fix this - need unique_to_indices mapping
+```
+— 第三點最關鍵：如果 agent 用英文原文做 key，LLM 自己搞唔掂，要用 `unique_to_indices.json` mapping 先救到。
+
+#### 15.3 Orchestrator（批次管理）
+
+用 prompt 安排 parallel execution：
+
+```
+Batch plan: 6 episodes at a time
+For each episode:
+  Step 1: Extract unique texts via translate_bulk.py
+  Step 2: Spawn subagent to translate (parallel)
+  Step 3: Apply translations
+  Step 4: Verify CJK > 90%
+  Step 5: Copy to Z drive
+Batch sequence: S3E01-E06 → S3E07-E12 → S3E13-E18 ...
+```
+
+**實戰心得：**
+- 唔好一次做超過 7 個 parallel agents — LLM 後台會 timeout
+- 每 batch 做完要停低 check 結果，唔好全部 auto-pilot
+- Agent translate 嘅時候可以同時做下一 batch 嘅 extract（pipeline overlapping）
+
+#### 15.4 EN Scout（網絡搵餵）
+
+```
+Search for: "SEAL Team S03E20 english subtitles srt download"
+Try in order:
+  1. tvsubtitles.net - download zip with CookieJar
+  2. subtitlecat.com - extract SRT from embed in HTML
+  3. opensubtitles.com - API search
+Priority: WEB-DL version > HDTV > WEBRip
+```
+— 要俾 fallback order，因為每個站點 availability 唔同。
+
+**通用 prompt 模式總結：**
+
+| 角色 | Prompt 結構 | 必加元素 |
+|------|-----------|---------|
+| Translator | 規則 + 範例 + 反面限制 + domain context | Output format example, what NOT to do |
+| Formatter | 問題描述 + 解決步驟 + 限制說明 | Which problems are fixable vs not |
+| Orchestrator | 流程圖 + batch 分組 + verify gate | Stop condition, error handling |
+| EN Scout | Search query + fallback list + priority | Ordered alternatives, version preference |
+
+### 16. 人名、術語、關鍵字嘅處理策略
+
+呢 part 係 32 集實戰入面最常改嘅位。唔同類型嘅字要唔同玩法：
+
+#### 16.1 角色名 — 一定留英文
+
+**規則：** 所有角色名 keep 英文，唔譯做中文。
+```
+Jason → Jason（唔係 賈森）
+Sonny → Sonny（唔係 桑尼）
+Clay → Clay（唔係 克萊）
+Cerberus → Cerberus（唔係 地獄三頭犬）
+```
+
+**點解：**
+- Plex/Kodi 用家睇開英文名，突然變中文會搵唔到角色
+- 軍事劇角色名经常喺 radio call 出現（"Bravo 1, this is Jason"），中英夾雜會亂
+
+**Prompt 寫法：**
+```
+Character names stay in English: Jason, Sonny, Clay, Trent, Ray, Brock, Blackburn, Mandy, Lisa, Davis, Cerberus
+```
+— 要 explicit list，唔好剩係講 "keep names in English"。Agent 有時會譯埋一啲你唔想譯嘅名。
+
+#### 16.2 軍事術語 — 有 mapping 表
+
+呢啲唔可以就咁直譯，要逐個配 Cantonese 對應：
+
+| 英文 | 要譯做 | 唔好譯做 |
+|------|--------|---------|
+| Copy / Copy that | 收到 | 複製 / 明白 |
+| Roger / Roger that | 明白 | 羅傑 |
+| How copy? | 收唔收到？ | 怎麼複製？ |
+| This is Bravo 1 | 呢度係 Bravo 1 | 這是Bravo 1 |
+| Out | 收線 | 結束 / 完畢 |
+| Over | 完 | 結束 |
+| Stand by | 等陣 | 等待 |
+| Moving | 移動中 | 正在移動 |
+| Tango (target) | 目標 / Tango 留英文都得 | 探戈 |
+| ROE (rules of engagement) | ROE 留英文 | 交戰規則 |
+| STA-21 | STA-21 留英文 | 唔好譯 |
+| PTS / TBI / CTE | 留英文縮寫 | 創傷後壓力/創傷性腦損傷 |
+| Klick (km) | Klick / 公里 都得 | 唔好直譯做「點擊」 |
+| BREACH / DOOR | 留英文大寫 | 攻堅 / 門 |
+
+**Prompt 技巧：**
+```
+Military radio: "Copy"→"收到", "Roger"→"明白", "this is"→"呢度係", "out"→"收線"
+```
+— 逐個 mapping 寫清楚，agent 好少會錯。
+
+#### 16.3 音效／場景描述 — 中文化
+
+呢啲原文係 `[brackets]`，可以譯做中文：
+
+```
+[gunshots] → [槍聲]
+[door opens] → [門開]
+[sighs] → [嘆氣]
+[chuckles] → [輕笑]
+[explosion] → [爆炸聲]
+[radio chatter] → [無線電通訊聲]
+```
+— 用中文 bracket 可以提高 CJK%，睇落亦整齊啲。但唔譯都冇問題，QC 唔會因為呢啲扣分。
+
+#### 16.4 歌詞 — 一定留英文
+
+所有 ♪ 開頭嘅歌詞 segment 保持原文，唔譯。
+
+**點解：** 歌詞譯咗會同背景音樂唔夾，觀眾睇到會好奇怪。
+
+#### 16.5 Credit／水印 — 全部 filter 走
+
+呢啲段唔應該出現喺 output SRT：
+
+```
+YYeTs, 原創翻譯, 原创翻译, 雙語字幕, 双语字幕, 請登陸, 请登陆,
+www.*, 僅供交流, 仅供交流, 禁止商用, Sallybear, TVyoung,
+校对, 校對, 時間軸, 时间轴, 翻译 哈里, 後期, 后期, 總監, 总监
+```
+— `apply_translations.py` 入面有個 `credit_pats` list， detect 到呢啲 pattern 就 skip 唔 apply translation。
+
+#### 16.6 品牌／機構名 — 視情況
+
+| 類型 | 做法 | 例子 |
+|------|------|------|
+| 美國軍事基地/單位 | 留英文 | DEVGRU, BUD/S, SOCOM, GHQ |
+| 外國組織 | 第一次出現附中文，之後留英文 | SGS (大薩赫勒·薩哈巴) → 之後 SGS |
+| 品牌產品 | 留英文 | Horny Lizard Hot Sauce, Dr. Phil |
+| 地名 | 睇慣用程度 | Cairo（開羅）/ Afghanistan（阿富汗）留中文，細地名留英文 |
+
+#### 16.7 節目固有格式 — 標準化
+
+固定句式要統一：
+
+```
+Previously on SEAL Team... → 上集重溫 SEAL Team...
+Previously on SAS Rogue Heroes... → 上集重溫 SAS Rogue Heroes...
+Next week on SEAL Team... → 下集預告 SEAL Team...
+Episode title cards → 《標題》
+```
+
+— 呢啲唔靠 agent 自由發揮，應該直接喺 prompt 寫明 mapping。
+
+#### 16.8 實戰總結表
+
+| 類別 | 處理方式 | 喺邊度控制 |
+|------|---------|-----------|
+| 角色名 | Keep 英文 + explicit list | Translator prompt |
+| 軍事 radio | Mapping 表逐個配 Cantonese | Translator prompt |
+| 音效 `[brackets]` | 可中文化可唔譯 | Translator prompt / 可選 |
+| 歌詞 ♪ | 留原文 | Translator rules |
+| Credit 水印 | Regex filter skip | `apply_translations.py` credit_pats |
+| 機構/地名 | 第一次附中文，之後留英文 | Translator judgment |
+| 節目固定格式 | 標準 mapping | Translator prompt |
+
+### 17. 點樣保持跨集一致性
+
+32 集由唔同 agent instance 獨立譯，唔做嘢嘅話一定唔一致。以下係實戰方法：
+
+#### 17.1 同一套 Prompt Template
+
+每集用同一個 prompt 結構，保證 rules 一樣：
+
+```
+Translate SEAL Team S05E01 "Title" English to natural Cantonese (zh-hk).
+[CRITICAL output format]
+[Character names list]
+[Military radio mapping table]
+[Cantonese particle rules]
+[What NOT to do]
+```
+
+— 唔好每集 rewrite prompt，直接 copy-paste 改集數同 title 就得。
+
+#### 17.2 第一集做 Anchor
+
+第一集（或 pilot）譯完之後，抽出一個「style reference」放喺後續 prompt：
+
+```
+Style reference (from E01):
+  "Copy that" → "收到"
+  "This is Bravo 1" → "呢度係 Bravo 1"
+  "Previously on SEAL Team" → "上集提要 SEAL Team"
+  Tone: casual military, not formal
+```
+
+— 但要注意：agent 有時會 overfit 個 reference，變咗照抄而唔係 translate。
+
+#### 17.3 Fixed Mapping 表做非經常性鎖定
+
+軍事 radio 呢類一定要鎖死：
+
+| 英文 | 強制譯法 |
+|------|---------|
+| Copy / Copy that | 收到 |
+| How copy? | 收唔收到？ |
+| This is ... | 呢度係 ... |
+| Out | 收線 |
+| Roger | 明白 |
+
+— 呢啲寫喺 prompt 嘅 rules section，唔係 suggestion，係 requirement。
+
+#### 17.4 「Previously on」呢類要統一
+
+我哋踩過嘅坑：
+```
+E09: "上集重溫 SEAL Team..."
+E10: "上集提要 SEAL Team..."
+E11: "Previously on SEAL Team..."
+```
+
+三集三個譯法。Fix 方法：喺 prompt 加 explicit mapping：
+```
+Previously on... → 上集提要...
+— 一定要用呢個格式，唔好自由發揮。
+```
+
+#### 17.5 Agent 獨立翻譯嘅代價（我哋嘅取捨）
+
+32 集 fix 嘅 trade-off：
+
+| 方法 | 一致性 | 速度 | 適合 |
+|------|--------|------|------|
+| 每集獨立 agent（我哋用嘅） | ❌ 中低 | ✅ 快（parallel） | 大量爛翻譯要快速 fix |
+| 共用 glossary + 逐集 reference | ✅ 中 | ⚠️ 中等 | 想平衡速度同 quality |
+| 全部同一 agent 逐集譯 | ✅ 高 | ❌ 慢（sequential） | 新劇第一季，要精品 |
+| post-hoc normalization script | ✅ 高 | ✅ 快（batch） | 做完先統一執 |
+
+**我哋點解揀每集獨立 agent：**
+- 32 集爛翻譯 priority 係「快啲變做自然粵語」>「完美一致」
+- 觀眾唔會同一時間睇兩集，微細嘅 inconsistency 唔會 notice
+- 角色名、軍事 radio 呢啲關鍵位已經用 prompt lock 死咗
+
+**如果要完美一致（例如新劇第一季）：**
+1. 第一集用人手 prompt 做到滿意
+2. 抽 glossary（角色名、術語、固定片語）
+3. 後續每集 prompt 入面 attach 個 glossary 做 reference
+4. 全部做完之後行一次 normalization scan
+
+**Normalization scan（做完先執）：**
+```python
+# 做完 32 集之後 scan 常見 inconsistency
+inconsistencies = {
+    "上集重溫": "上集提要",  # E09 用重溫，E10 用提要
+    "梗係": "當然",          # 如果 tone 唔一致
+}
+for srt_file in all_zh_files:
+    for sub in pysubs2.load(srt_file):
+        for old, new in inconsistencies.items():
+            if old in sub.plaintext:
+                sub.plaintext = sub.plaintext.replace(old, new)
+```
+— 呢個方法最快最穩，適合大量批量 fix。
+
+### 18. File-based Translation Memory（TM）
+
+#### 18.1 點解需要 TM
+
+32 集實戰發現：約 30% 嘅 unique text 跨集重複。唔用 TM 嘅話：
+
+```
+E09: "Copy that" → agent 譯做 "收到"
+E10: "Copy that" → agent 再譯一次 "收到"（一樣但浪費token）
+E11: "Copy that" → 如果轉咗 agent/LLM，可能譯做 "明白"（唔一致！）
+```
+
+TM 解決三個問題：
+1. **Compacting** — skip 已知翻譯，agent 只需處理新 text → unique 由 ~800 降到 ~550
+2. **Switching agents** — 就算由 Claude 轉 GPT 再轉 DeepSeek，已知短語一律 lookup TM，唔受 agent 變更影響
+3. **Consistency** — "上集提要" 唔會變 "上集重溫"，因為 TM 入面已經鎖死
+
+#### 18.2 實作：一個 JSON  file 搞掂
+
+最簡單嘅形式 — 一個 flat JSON 做 TM：
+
+```json
+{
+  "Copy that": "收到",
+  "Roger that": "明白",
+  "All right.": "好。",
+  "Yeah.": "係。",
+  "Come on.": "嚟啦。",
+  "Previously on SEAL Team...": "上集提要 SEAL Team...",
+  "...": "..."
+}
+```
+
+預估 size：32 集 × ~8000 條 unique text（含重複）→ ~10-15MB，完全 flat JSON 勝任。
+
+#### 18.3 Pipeline 點樣食 TM
+
+```
+1. 讀 TM.json（如果存在）
+2. translate_bulk.py 抽 unique texts
+3. 逐條 check TM：
+    - 喺 TM 入面 → 直接 pre-fill
+    - 唔喺 TM 入面 → 留俾 agent 譯
+4. Agent 只譯新 text
+5. Apply translations 時：
+    - TM hit → 用 TM 嘅 translation
+    - Agent hit → 用 agent 嘅 translation
+6. Agent 譯完嘅新 text 全部 merge 入 TM.json
+```
+
+#### 18.4 Implementation sketch
+
+```python
+import json
+
+def load_tm(path="translation_memory.json"):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_tm(tm, path="translation_memory.json"):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(tm, f, ensure_ascii=False, indent=2)
+
+tm = load_tm()
+
+# Before agent translate: filter out known texts
+new_texts = [t for t in unique_texts if t not in tm]
+
+# Agent translates only new_texts → agent_translations dict
+# agent_translations = {"How's it going?": "點呀你？", ...}
+
+# After agent done: merge into TM
+for en, zh in agent_translations.items():
+    if en not in tm:
+        tm[en] = zh
+
+save_tm(tm)
+```
+
+#### 18.5 TM 嘅進化路徑
+
+| Stage | 形式 | 效用 | 咩時候夠用 |
+|-------|------|------|-----------|
+| 0 (而家) | 冇 TM | 0% dedup | 一次性 32 集 fix |
+| 1 (建議) | Flat JSON `{en: zh}` | ~30% dedup | 同一套劇嘅批量 fix |
+| 2 | JSON + `{en: {zh, source_ep, date, agent}}` | 可 audit | 多套劇共用，要追 source |
+| 3 | SQLite + index | ~50% dedup（fuzzy match） | 跨劇 fuzzy match，例如 "Copy"→"收到" 可以 match "Copy that" |
+
+**Stage 1 已經夠用**：32 集做完 TM 會有 ~8000 條 entry，下次再做 SEAL S6 或者另一套軍事劇，可以直接 reuse。
+
+#### 18.6 Switching Agents 點樣運作
+
+TM 係 agent-agnostic：
+
+```
+TM: {"Copy that": "收到", ...}
+
+E01 用 Agent A（DeepSeek）：
+  Agent 見到 "Copy that" → 但！TM pre-fill 咗 → agent 唔使譯
+  → Output: "收到"
+
+E02 用 Agent B（GPT）：
+  Agent 見到 "Copy that" → TM pre-fill → "收到"
+  → Output: 都係 "收到"（一致！）
+
+E03 轉返 Agent A：
+  → 一樣 "收到"
+```
+
+關鍵：**TM lookup 喺 agent translate 之前做**，唔係之後。agent 永遠唔會見到已知 text，自然唔會 produce 唔一致嘅 translation。
+
+#### 18.7 同 glossary 嘅分別
+
+| | Glossary | TM |
+|--|----------|-----|
+| 咩內容 | 角色名、術語、固定片語 | 所有 text（包括對話、音效、短語） |
+| 點維護 | 人手編輯 / agent detect | 自動累積 |
+| Size | 幾十至幾百條 | 幾千至幾萬條 |
+| Match 方式 | 精準（角色名） | 精準（string exact match） |
+| 用途 | 保護 domain terms | Reduce agent workload + 保證一致性 |
+
+**實際用法：** TM 做 main lookup，glossary 做 override（例如 TM 話 "Jason"→"Jason" 但你想譯做 "積遜"，glossary priority 高過 TM）。
+
+
+### 19. 維度對比：批量劇集 vs 單一電影
+|------|-------------------|---------|
+| **EN 來源** | 逐集下載 / 從字幕站 ZIP 批量拎 | bilingual SRT（同一 file 有中英） |
+| **Unique 量** | ~800/集，角色名地名大量重複 | ~1500-2500 total，重複少 |
+| **Agent 策略** | parallel agents 各譯一集，同時開 6-7 個 | 單一 agent 一次性譯晒，或者 split 做 2-3 batch |
+| **Glossary** | 角色名全季一致，第一集譯好後面跟返 | 一次性，唔需要跨 file 一致性 |
+| **QC 標準** | CJK > 90% 可收貨，少量音效/歌詞唔計較 | CJK > 95%，因為得一集可以逐段睇 |
+| **最大風險** | Agent JSON format 唔一致 → 36 集入面有 4 集炒咗要 fix | JSON format 炒咗 fix 一次就得 |
+| **時間分佈** | extract 1min + translate 2min + apply 30s = ~4min/集，但 parallel 就 ~30min total | 全部 sequential，~10-20min |
+| **EN SRT 獲取** | 最好用 tvsubtitles.net ZIP 一鑊過 download 14 集 | 通常 bilingual SRT 已有 EN embedded，唔使另搵 |
+| **處理速度** | parallel → ~4 粒鐘搞掂 32 集（wall time） | ~15 分鐘一齣 |
+| **Alignment 風險** | 高！新 DL 嘅 EN SRT timing 可能同 MKV 唔 match | 低！bilingual 原檔 timing 一定 match |
+
+**Recommendation：**
+- **電視劇**：用 `translate_bulk.py` + parallel subagents，每集開一個獨立 task
+- **電影**：用 Mode C (single subagent translate all unique)，或者直接 pysubs2 load bilingual SRT → extract EN → translate → replace Chinese part in-place
+
+**電影專屬捷徑（如果 bilingual SRT 入面 EN 完整）：**
+```python
+# 唔使另外搵 EN SRT！直接從 bilingual 抽 EN
+for sub in subs:
+    lines = sub.plaintext.split('\\n')
+    en = [l for l in lines if re.search(r'[a-zA-Z]{3,}', l) and not re.search(r'[\\u4e00-\\u9fff]', l)]
+    # 譯完 replace 返 bilingual 嘅中文部份
+```
 ---
 
 **Q: 翻譯後時間碼變了？**
